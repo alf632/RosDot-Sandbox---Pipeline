@@ -1,10 +1,11 @@
 docker run -it --rm \
   --name realsense_cam1_calib \
   --network host \
+  --ipc=host \
   --privileged \
   -v /dev/bus/usb:/dev/bus/usb \
   -e ROS_DOMAIN_ID=42 \
-  <your_image_name> \
+  raspi-realsense_streamer \
   bash -c "source /opt/ros/humble/setup.bash && \
   ros2 launch realsense2_camera rs_launch.py \
   camera_name:=cam1 \
