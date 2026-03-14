@@ -7,13 +7,17 @@ docker run -it --rm \
   -e ROS_DOMAIN_ID=42 \
   raspi-realsense_streamer \
   bash -c "source /opt/ros/humble/setup.bash && \
-  ros2 launch realsense2_camera rs_launch.py \
-  camera_name:=cam1 \
-  enable_color:=true \
-  enable_depth:=false \
-  enable_infra1:=true \
-  enable_infra2:=false \
-  rgb_camera.profile:=1920x1080x30 \
-  infra_profile:=848x480x30 \
-  align_depth.enable:=true \
-  depth_module.emitter_enabled:=0"
+  ros2 run realsense2_camera realsense2_camera_node \
+  --ros-args \
+  -r __node:=cam1 \
+  -r __ns:=/ \
+  -p camera_name:=cam1 \
+  -p initial_reset:=true \
+  -p enable_color:=true \
+  -p enable_depth:=false \
+  -p enable_infra1:=true \
+  -p enable_infra2:=false \
+  -p depth_module.profile:=848x480x30 \
+  -p rgb_camera.profile:=1920x1080x30 \
+  -p depth_module.emitter_enabled:=0 \
+  -p align_depth.enable:=true"
