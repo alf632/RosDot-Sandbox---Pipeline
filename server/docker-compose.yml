@@ -1,0 +1,153 @@
+version: '3.9'
+
+# --- YAML Anchors to keep the file DRY (Don't Repeat Yourself) ---
+x-ros-base: &ros-base
+  image: ros:humble-ros-base
+  network_mode: "host"
+  restart: unless-stopped
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+x-merger-base: &merger-base
+  build: ./cloud_merger_ws
+  network_mode: "host"
+  restart: unless-stopped
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+services:
+
+  # ==========================================
+  # 1. STATIC TRANSFORMS (From Auto-Calibration)
+  # ==========================================
+  tf_cam1:
+    <<: *ros-base
+    env_file: [ ./tf_configs/cam1_tf.env ]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash && 
+      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam1_link"
+
+  tf_cam2:
+    <<: *ros-base
+    env_file: [ ./tf_configs/cam2_tf.env ]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash && 
+      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam2_link"
+
+  tf_cam3:
+    <<: *ros-base
+    env_file: [ ./tf_configs/cam3_tf.env ]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash && 
+      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam3_link"
+
+  tf_cam4:
+    <<: *ros-base
+    env_file: [ ./tf_configs/cam4_tf.env ]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash && 
+      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam4_link"
+
+
+  # ==========================================
+  # 2. DECOMPRESSION & POINT CLOUD GENERATION
+  # ==========================================
+  # These nodes take the compressed depth streams from the network 
+  # and inflate them back into 3D points.
+  proc_cam1:
+    <<: *merger-base
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+      ros2 run depth_image_proc point_cloud_xyz 
+      --ros-args -p image_transport:=compressedDepth 
+      -r image_rect:=/cam1/depth/image_rect_raw 
+      -r camera_info:=/cam1/depth/camera_info 
+      -r points:=/cam1/depth/points"
+
+  proc_cam2:
+    <<: *merger-base
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+      ros2 run depth_image_proc point_cloud_xyz 
+      --ros-args -p image_transport:=compressedDepth 
+      -r image_rect:=/cam2/depth/image_rect_raw 
+      -r camera_info:=/cam2/depth/camera_info 
+      -r points:=/cam2/depth/points"
+
+  proc_cam3:
+    <<: *merger-base
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+      ros2 run depth_image_proc point_cloud_xyz 
+      --ros-args -p image_transport:=compressedDepth 
+      -r image_rect:=/cam3/depth/image_rect_raw 
+      -r camera_info:=/cam3/depth/camera_info 
+      -r points:=/cam3/depth/points"
+
+  proc_cam4:
+    <<: *merger-base
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+      ros2 run depth_image_proc point_cloud_xyz 
+      --ros-args -p image_transport:=compressedDepth 
+      -r image_rect:=/cam4/depth/image_rect_raw 
+      -r camera_info:=/cam4/depth/camera_info 
+      -r points:=/cam4/depth/points"
+
+
+  # ==========================================
+  # 3. POINT CLOUD MERGING & FILTERING
+  # ==========================================
+  # Syncs the 4 streams, transforms them to sandbox_origin, merges, and cuts off >0.5m
+  cloud_merger:
+    <<: *merger-base
+    depends_on:
+      - proc_cam1
+      - proc_cam2
+      - proc_cam3
+      - proc_cam4
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash && 
+      source /ros2_ws/install/setup.bash && 
+      ros2 run cloud_merger merge_node"
+
+
+  # ==========================================
+  # 4. ELEVATION MAPPING (GPU Accelerated)
+  # ==========================================
+  elevation_mapping:
+    image: anybotics/elevation_mapping_gpu:latest # Ensure you pull/build their ROS 2 image
+    network_mode: "host"
+    restart: unless-stopped
+    environment:
+      - ROS_DOMAIN_ID=42
+    volumes:
+      # Mount your custom parameter file directly into the container
+      - ./elevation_mapping_params.yaml:/tmp/elevation_mapping_params.yaml:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+      ros2 launch elevation_mapping_gpu elevation_mapping.launch.py
+      config_file:=/tmp/elevation_mapping_params.yaml"
+
+  # ==========================================
+  # 5. UDP HEIGHTMAP STREAMER (ROS 2 to Godot)
+  # ==========================================
+  udp_streamer:
+    <<: *ros-base
+    build: ./udp_streamer
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - GODOT_IP=172.20.0.1
+      - GODOT_PORT=4242
+    depends_on:
+      - elevation_mapping

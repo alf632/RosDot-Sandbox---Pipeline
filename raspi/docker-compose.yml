@@ -1,0 +1,22 @@
+version: '3.9'
+
+services:
+  realsense_streamer:
+    build: .
+    container_name: realsense_cam1
+    network_mode: "host"       # Crucial: allows ROS 2 DDS to discover the central server on the local network
+    privileged: true           # Grants the container access to all USB devices
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb # Maps the USB bus into the container
+    environment:
+      - ROS_DOMAIN_ID=42       # MUST match the ROS_DOMAIN_ID on your central server
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+      ros2 launch realsense2_camera rs_launch.py 
+      camera_name:=cam1 
+      enable_color:=false 
+      enable_infra1:=false 
+      enable_infra2:=false 
+      pointcloud.enable:=false 
+      depth_module.profile:=848x480x30"

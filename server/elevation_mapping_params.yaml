@@ -1,0 +1,31 @@
+elevation_mapping:
+  ros__parameters:
+    # ----------------------------------------------------
+    # 1. INPUT CONFIGURATION
+    # ----------------------------------------------------
+    # This is how it knows to listen to your C++ node!
+    point_cloud_topic: "/merged_filtered_cloud"
+    
+    # The global coordinate frame everything is operating in
+    map_frame_id: "sandbox_origin"
+    
+    # ----------------------------------------------------
+    # 2. MAP DIMENSIONS (For your 4m x 6m Sandbox)
+    # ----------------------------------------------------
+    length_in_x: 6.0    # Map length in meters
+    length_in_y: 4.0    # Map width in meters
+    
+    # Map resolution in meters (0.01 = 1 cm per pixel). 
+    # For a 6x4m box, 1cm resolution generates a 600x400 image.
+    resolution: 0.01    
+
+    # Initial position of the map center relative to sandbox_origin
+    position_x: 3.0
+    position_y: 2.0
+
+    # ----------------------------------------------------
+    # 3. FILTERING & PHYSICS
+    # ----------------------------------------------------
+    # How fast the map updates/forgets old data (useful for moving sand/hands)
+    time_variance: 0.01 
+    time_interval: 0.1  # Update rate in seconds (0.1 = 10Hz)
