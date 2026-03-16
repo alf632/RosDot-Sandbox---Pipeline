@@ -12,11 +12,16 @@ services:
       - ROS_DOMAIN_ID=42       # MUST match the ROS_DOMAIN_ID on your central server
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     command: >
-      bash -c "source /opt/ros/humble/setup.bash &&
-      ros2 launch realsense2_camera rs_launch.py 
-      camera_name:=cam1 
-      enable_color:=false 
-      enable_infra1:=false 
-      enable_infra2:=false 
-      pointcloud.enable:=false 
-      depth_module.profile:=848x480x30"
+      bash -c "source /opt/ros/humble/setup.bash && \
+      ros2 run realsense2_camera realsense2_camera_node \
+      --ros-args \
+      -r __node:=cam1 \
+      -r __ns:=/camera \
+      -p camera_name:=cam1 \
+      -p enable_color:=false \
+      -p enable_infra1:=false \
+      -p enable_infra2:=false \
+      -p pointcloud.enable:=false \
+      -p enable_depth:=true \
+      -p depth_module.profile:=848x480x30 \
+      -p depth_module.emitter_enabled:=1"

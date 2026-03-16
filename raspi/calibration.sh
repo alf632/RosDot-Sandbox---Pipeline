@@ -10,7 +10,7 @@ docker run -it --rm \
   ros2 run realsense2_camera realsense2_camera_node \
   --ros-args \
   -r __node:=cam1 \
-  -r __ns:=/ \
+  -r __ns:=/camera \
   -p camera_name:=cam1 \
   -p initial_reset:=true \
   -p enable_color:=true \
