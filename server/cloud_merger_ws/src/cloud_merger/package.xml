@@ -2,17 +2,22 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>cloud_merger</name>
-  <version>0.0.0</version>
-  <description>Asynchronously merges and filters multi-cam pointclouds</description>
-  <maintainer email="dev@example.com">Dev</maintainer>
+  <version>0.1.0</version>
+  <description>High-performance PointCloud2 to 2D Heightmap merger for AR Sandbox</description>
+  <maintainer email="dev@example.com">Developer</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
   <depend>tf2_ros</depend>
-  <depend>tf2_sensor_msgs</depend>
+  <depend>tf2_geometry_msgs</depend>
   <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>opencv</depend>
 
   <export>
     <build_type>ament_cmake</build_type>
