@@ -1,9 +1,8 @@
-version: '3.9'
-
 # --- YAML Anchors to keep the file DRY (Don't Repeat Yourself) ---
 x-ros-base: &ros-base
   image: ros:humble-ros-base
   network_mode: "host"
+  ipc: host
   restart: unless-stopped
   environment:
     - ROS_DOMAIN_ID=42
@@ -12,6 +11,7 @@ x-ros-base: &ros-base
 x-merger-base: &merger-base
   build: ./cloud_merger_ws
   network_mode: "host"
+  ipc: host
   restart: unless-stopped
   environment:
     - ROS_DOMAIN_ID=42
@@ -27,28 +27,28 @@ services:
     env_file: [ ./tf_configs/cam1_tf.env ]
     command: >
       bash -c "source /opt/ros/humble/setup.bash && 
-      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam1_link"
+      ros2 run tf2_ros static_transform_publisher --x $${TF_X} --y $${TF_Y} --z $${TF_Z} --qx $${TF_QX} --qy $${TF_QY} --qz $${TF_QZ} --qw $${TF_QW} --frame-id sandbox_origin --child-frame-id cam1_link"
 
   tf_cam2:
     <<: *ros-base
     env_file: [ ./tf_configs/cam2_tf.env ]
     command: >
       bash -c "source /opt/ros/humble/setup.bash && 
-      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam2_link"
+      ros2 run tf2_ros static_transform_publisher --x $${TF_X} --y $${TF_Y} --z $${TF_Z} --qx $${TF_QX} --qy $${TF_QY} --qz $${TF_QZ} --qw $${TF_QW} --frame-id sandbox_origin --child-frame-id cam2_link"
 
   tf_cam3:
     <<: *ros-base
     env_file: [ ./tf_configs/cam3_tf.env ]
     command: >
       bash -c "source /opt/ros/humble/setup.bash && 
-      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam3_link"
+      ros2 run tf2_ros static_transform_publisher --x $${TF_X} --y $${TF_Y} --z $${TF_Z} --qx $${TF_QX} --qy $${TF_QY} --qz $${TF_QZ} --qw $${TF_QW} --frame-id sandbox_origin --child-frame-id cam3_link"
 
   tf_cam4:
     <<: *ros-base
     env_file: [ ./tf_configs/cam4_tf.env ]
     command: >
       bash -c "source /opt/ros/humble/setup.bash && 
-      ros2 run tf2_ros static_transform_publisher $${TF_X} $${TF_Y} $${TF_Z} $${TF_ROLL} $${TF_PITCH} $${TF_YAW} sandbox_origin cam4_link"
+      ros2 run tf2_ros static_transform_publisher --x $${TF_X} --y $${TF_Y} --z $${TF_Z} --qx $${TF_QX} --qy $${TF_QY} --qz $${TF_QZ} --qw $${TF_QW} --frame-id sandbox_origin --child-frame-id cam4_link"
 
 
   # ==========================================
@@ -60,42 +60,37 @@ services:
     <<: *merger-base
     command: >
       bash -c "source /opt/ros/humble/setup.bash &&
-      ros2 run depth_image_proc point_cloud_xyz 
-      --ros-args -p image_transport:=compressedDepth 
-      -r image_rect:=/cam1/depth/image_rect_raw 
-      -r camera_info:=/cam1/depth/camera_info 
-      -r points:=/cam1/depth/points"
+      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
+      -r image_rect:=/camera/cam1/depth/image_rect_raw
+      -r camera_info:=/camera/cam1/depth/camera_info
+      -r points:=/cam1/pointcloud"
 
   proc_cam2:
     <<: *merger-base
     command: >
       bash -c "source /opt/ros/humble/setup.bash &&
-      ros2 run depth_image_proc point_cloud_xyz 
-      --ros-args -p image_transport:=compressedDepth 
-      -r image_rect:=/cam2/depth/image_rect_raw 
-      -r camera_info:=/cam2/depth/camera_info 
-      -r points:=/cam2/depth/points"
+      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
+      -r image_rect:=/camera/cam2/depth/image_rect_raw
+      -r camera_info:=/camera/cam2/depth/camera_info
+      -r points:=/cam2/pointcloud"
 
   proc_cam3:
     <<: *merger-base
     command: >
       bash -c "source /opt/ros/humble/setup.bash &&
-      ros2 run depth_image_proc point_cloud_xyz 
-      --ros-args -p image_transport:=compressedDepth 
-      -r image_rect:=/cam3/depth/image_rect_raw 
-      -r camera_info:=/cam3/depth/camera_info 
-      -r points:=/cam3/depth/points"
+      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
+      -r image_rect:=/camera/cam2/depth/image_rect_raw
+      -r camera_info:=/camera/cam2/depth/camera_info
+      -r points:=/cam2/pointcloud"
 
   proc_cam4:
     <<: *merger-base
     command: >
       bash -c "source /opt/ros/humble/setup.bash &&
-      ros2 run depth_image_proc point_cloud_xyz 
-      --ros-args -p image_transport:=compressedDepth 
-      -r image_rect:=/cam4/depth/image_rect_raw 
-      -r camera_info:=/cam4/depth/camera_info 
-      -r points:=/cam4/depth/points"
-
+      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
+      -r image_rect:=/camera/cam2/depth/image_rect_raw
+      -r camera_info:=/camera/cam2/depth/camera_info
+      -r points:=/camera/cam2/pointcloud"
 
   # ==========================================
   # 3. POINT CLOUD MERGING & FILTERING
@@ -103,15 +98,13 @@ services:
   # Syncs the 4 streams, transforms them to sandbox_origin, merges, and cuts off >0.5m
   cloud_merger:
     <<: *merger-base
-    depends_on:
-      - proc_cam1
-      - proc_cam2
-      - proc_cam3
-      - proc_cam4
     command: >
       bash -c "source /opt/ros/humble/setup.bash && 
       source /ros2_ws/install/setup.bash && 
-      ros2 run cloud_merger merge_node"
+      ros2 run cloud_merger dynamic_merger \
+      --ros-args \
+      -p timer_interval_ms:=50 \
+      -p camera_topics:=\"['/cam1/pointcloud', '/cam2/pointcloud', '/cam3/pointcloud', '/cam4/pointcloud']\""
 
 
   # ==========================================
@@ -120,6 +113,7 @@ services:
   elevation_mapping:
     image: anybotics/elevation_mapping_gpu:latest # Ensure you pull/build their ROS 2 image
     network_mode: "host"
+    ipc: host
     restart: unless-stopped
     environment:
       - ROS_DOMAIN_ID=42

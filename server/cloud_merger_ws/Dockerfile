@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     ros-humble-tf2-ros \
     ros-humble-tf2-sensor-msgs \
     libpcl-dev \
+    ros-humble-depth-image-proc \
+    ros-humble-compressed-depth-image-transport \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up the colcon workspace

@@ -3,14 +3,13 @@
 <package format="3">
   <name>cloud_merger</name>
   <version>0.0.0</version>
-  <description>Merges and filters multi-cam pointclouds</description>
+  <description>Asynchronously merges and filters multi-cam pointclouds</description>
   <maintainer email="dev@example.com">Dev</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
-  <depend>message_filters</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_sensor_msgs</depend>
   <depend>pcl_conversions</depend>
