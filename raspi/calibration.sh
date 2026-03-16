@@ -6,7 +6,7 @@ docker run -it --rm \
   -v /dev/bus/usb:/dev/bus/usb \
   -e ROS_DOMAIN_ID=42 \
   raspi-realsense_streamer \
-  bash -c "source /opt/ros/humble/setup.bash && \
+  bash -c "source /opt/ros/jazzy/setup.bash && \
   ros2 run realsense2_camera realsense2_camera_node \
   --ros-args \
   -r __node:=cam1 \

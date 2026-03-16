@@ -27,8 +27,8 @@ for i in {1..4}; do
 
     # 2. Grab the transform using tf2_echo and a 5-second timeout
     echo "Extracting transform from sandbox_origin to ${CAM}_link..."
-    TF_OUTPUT=$(docker run --rm --network host --ipc=host -e ROS_DOMAIN_ID=42 ros:humble-ros-base \
-      bash -c 'source /opt/ros/humble/setup.bash && \
+    TF_OUTPUT=$(docker run --rm --network host --ipc=host -e ROS_DOMAIN_ID=42 ros:jazzy-ros-base \
+      bash -c 'source /opt/ros/jazzy/setup.bash && \
       timeout 30 ros2 run tf2_ros tf2_echo sandbox_origin "$1" | \
       while IFS= read -r line; do \
         echo "$line"; \
