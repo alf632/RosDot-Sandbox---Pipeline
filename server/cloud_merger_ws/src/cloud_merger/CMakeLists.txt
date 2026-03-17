@@ -11,17 +11,15 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
-find_package(pcl_conversions REQUIRED)
-find_package(pcl_ros REQUIRED)
-find_package(PCL REQUIRED)
+find_package(tf2_eigen REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 
 # Include directories
 include_directories(
   include
-  ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIRS}
 )
 
 # Create the executable
@@ -35,14 +33,10 @@ ament_target_dependencies(dynamic_cloud_merger
   sensor_msgs
   cv_bridge
   tf2_ros
-  tf2_geometry_msgs
-  pcl_conversions
-  pcl_ros
+  tf2_eigen
 )
-ament_target_dependencies(heightmap_streamer rclcpp sensor_msgs cv_bridge)
 
 target_link_libraries(dynamic_cloud_merger
-  ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
 target_link_libraries(heightmap_streamer ${OpenCV_LIBRARIES})

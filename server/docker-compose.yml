@@ -50,48 +50,6 @@ services:
       bash -c "source /opt/ros/jazzy/setup.bash && 
       ros2 run tf2_ros static_transform_publisher --x $${TF_X} --y $${TF_Y} --z $${TF_Z} --qx $${TF_QX} --qy $${TF_QY} --qz $${TF_QZ} --qw $${TF_QW} --frame-id sandbox_origin --child-frame-id cam4_link"
 
-
-  # ==========================================
-  # 2. DECOMPRESSION & POINT CLOUD GENERATION
-  # ==========================================
-  # These nodes take the compressed depth streams from the network 
-  # and inflate them back into 3D points.
-  proc_cam1:
-    <<: *merger-base
-    command: >
-      bash -c "source /opt/ros/jazzy/setup.bash &&
-      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
-      -r image_rect:=/camera/cam1/depth/image_rect_raw
-      -r camera_info:=/camera/cam1/depth/camera_info
-      -r points:=/cam1/pointcloud"
-
-  proc_cam2:
-    <<: *merger-base
-    command: >
-      bash -c "source /opt/ros/jazzy/setup.bash &&
-      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
-      -r image_rect:=/camera/cam2/depth/image_rect_raw
-      -r camera_info:=/camera/cam2/depth/camera_info
-      -r points:=/cam2/pointcloud"
-
-  proc_cam3:
-    <<: *merger-base
-    command: >
-      bash -c "source /opt/ros/jazzy/setup.bash &&
-      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
-      -r image_rect:=/camera/cam2/depth/image_rect_raw
-      -r camera_info:=/camera/cam2/depth/camera_info
-      -r points:=/cam2/pointcloud"
-
-  proc_cam4:
-    <<: *merger-base
-    command: >
-      bash -c "source /opt/ros/jazzy/setup.bash &&
-      ros2 component standalone depth_image_proc depth_image_proc::PointCloudXyzNode
-      -r image_rect:=/camera/cam2/depth/image_rect_raw
-      -r camera_info:=/camera/cam2/depth/camera_info
-      -r points:=/camera/cam2/pointcloud"
-
   # ==========================================
   # 3. POINT CLOUD MERGING & FILTERING
   # ==========================================
@@ -103,11 +61,11 @@ services:
       source /ros2_ws/install/setup.bash && 
       ros2 run cloud_merger dynamic_cloud_merger \
       --ros-args \
-      -p sandbox_width:=4.0 \
-      -p sandbox_length:=6.0 \
-      -p resolution_per_meter:=100 \
-      -p max_step_size:=0.02 \
-      -p camera_topics:=\"['/cam1/pointcloud', '/cam2/pointcloud', '/cam3/pointcloud', '/cam4/pointcloud']\" \
+      -p sandbox_width:=1.0 \
+      -p sandbox_length:=1.0 \
+      -p resolution_per_meter:=256 \
+      -p max_step_size:=0.005 \
+      -p camera_prefixes:=\"['/camera/cam1', '/camera/cam2', '/camera/cam3', '/camera/cam4']\" \
       -p published_topic:=sandbox/heightmap \
       -p framerate:=30.0 \
       -p log_interval:=10.0"
@@ -125,5 +83,5 @@ services:
       ros2 run cloud_merger heightmap_streamer \
       --ros-args \
       -p udp_ip:=127.0.0.1 \
-      -p udp_port:=5005 \
+      -p udp_port:=4242 \
       -p input_topic:=sandbox/heightmap"

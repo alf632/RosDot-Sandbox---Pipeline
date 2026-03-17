@@ -17,6 +17,8 @@ public:
         this->declare_parameter("udp_ip", "127.0.0.1");
         this->declare_parameter("udp_port", 5005);
         this->declare_parameter("input_topic", "sandbox/heightmap");
+	this->declare_parameter("height_offset", 0.25f);
+	this->declare_parameter("height_range", 0.5f);
 
         // Socket setup
         sock_ = socket(AF_INET, SOCK_DGRAM, 0);
@@ -50,14 +52,18 @@ private:
         try {
             // 1. Convert ROS image to OpenCV
             cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, "32FC1");
+
+	    float offset = get_parameter("height_offset").as_double();
+            float range = get_parameter("height_range").as_double();; // total height of sandbox
+            float alpha = 255.0f / range;
+            float beta = offset * alpha;
             
             // 2. Normalize to 8-bit (0-255) or 16-bit (0-65535) for PNG
             // Godot's load_png_from_buffer works best with standard grayscale.
             cv::Mat gray_img;
             
-            // Assuming your sandbox height is roughly 0.0 to 1.0 meters. 
             // Scale by 255 to fill the 8-bit range.
-            cv_ptr->image.convertTo(gray_img, CV_8UC1, 255.0);
+            cv_ptr->image.convertTo(gray_img, CV_8UC1, alpha, beta);
 
             // 3. Encode to PNG in memory
             std::vector<uchar> buf;
