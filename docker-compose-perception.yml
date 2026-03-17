@@ -1,0 +1,28 @@
+services:
+  component_container:
+    build: 
+      context: sandbox_components/
+    network_mode: "host"
+    ipc: "host"
+    privileged: true
+    volumes:
+      - /dev:/dev
+    cpuset: "0-3"
+    environment:
+      - ROS_DOMAIN_ID=42
+
+  sandbox_operator:
+    build:
+      context: sandbox_operator/
+    network_mode: "host"
+    ipc: "host"
+    privileged: true
+    environment:
+      - ROS_DOMAIN_ID=42
+    volumes:
+      - /dev:/dev
+    depends_on:
+      - component_container
+    command: >
+      ros2 run sandbox_operator operator 
+      --ros-args -p role:=perception -p is_controller:=false

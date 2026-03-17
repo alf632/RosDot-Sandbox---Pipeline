@@ -1,0 +1,29 @@
+{
+  "roles": [
+    {
+      "name": "perception",
+      "loaders": ["realsense_loader", "repro_loader"]
+    },
+    {
+      "name": "merger",
+      "loaders": ["merger_loader"]
+    },
+    {
+      "name": "all",
+      "loaders": ["realsense_loader", "repro_loader", "merger_loader"]
+    }
+  ],
+  "loader_settings": {
+    "repro_loader": {
+      "output_res": {"width": 256, "height": 256},
+      "sandbox": {"width": 1.0, "length": 1.0}
+    },
+    "merger_loader": {
+      "output_res": {"width": 256, "height": 256},
+      "temporal_smoothing_factor": 5.0,
+      "temporal_min_alpha": 0.05,
+      "udp_ip": "127.0.0.1",
+      "udp_port": 4242
+    }
+  }
+}

@@ -1,0 +1,23 @@
+services:
+  component_container:
+    build: 
+      context: sandbox_components/
+    network_mode: "host"
+    ipc: "host"
+    environment:
+      - ROS_DOMAIN_ID=42
+
+  sandbox_operator:
+    build:
+      context: sandbox_operator/
+    network_mode: "host"
+    ipc: "host"
+    environment:
+      - ROS_DOMAIN_ID=42
+    volumes:
+      - ./config.json:/config/sandbox.json:ro
+    depends_on:
+      - component_container
+    command: >
+      ros2 run sandbox_operator operator 
+      --ros-args -p role:=merger -p is_controller:=true -p config_file_path:=/config/sandbox.json

@@ -1,5 +1,0 @@
-FROM ros:jazzy-ros-base
-
-RUN apt-get update && apt-get install -y ros-jazzy-apriltag-ros && rm -rf /var/lib/apt/lists/*
-
-CMD ["bash", "-c", "source /opt/ros/jazzy/setup.bash && ros2 run apriltag_ros apriltag_node --ros-args -r image_rect:=/camera/${CAM}/infra1/image_rect_raw -r camera_info:=/camera/${CAM}/infra1/camera_info --params-file /tmp/tags.yaml"]

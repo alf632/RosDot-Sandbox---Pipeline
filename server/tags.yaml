@@ -1,6 +1,0 @@
-apriltag:
-  ros__parameters:
-    size: 0.161  # The physical width of the black square in meters (measure yours!)
-    family: "36h11" # The standard AprilTag family
-    tags:
-      ids: [0, 1, 2, 3]

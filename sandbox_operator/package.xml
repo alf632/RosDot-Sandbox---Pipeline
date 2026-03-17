@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sandbox_operator</name>
+  <version>1.0.0</version>
+  <description>Unified Operator and Calibration TUI for AR Sandbox</description>
+  <maintainer email="dev@sandbox.com">Sandbox Dev</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>composition_interfaces</depend>
+
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
+  <depend>image_geometry</depend>
+
+  <depend>python3-numpy</depend>
+  <depend>python3-opencv</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
