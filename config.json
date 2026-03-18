@@ -6,11 +6,11 @@
     },
     {
       "name": "merger",
-      "loaders": ["merger_loader"]
+      "loaders": ["merger_loader", "tf_loader"]
     },
     {
       "name": "all",
-      "loaders": ["realsense_loader", "repro_loader", "merger_loader"]
+      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "tf_loader"]
     }
   ],
   "loader_settings": {
@@ -24,6 +24,9 @@
       "temporal_min_alpha": 0.05,
       "udp_ip": "127.0.0.1",
       "udp_port": 4242
+    },
+    "tf_loader": {
+      "config_dir": "/tmp/calibrations/tf_configs"
     }
   }
 }

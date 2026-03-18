@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-cv-bridge \
     ros-jazzy-image-geometry \
     ros-jazzy-message-filters \
+    ros-jazzy-apriltag-ros \
     python3-opencv \
     && rm -rf /var/lib/apt/lists/*
 

@@ -5,7 +5,7 @@ import curses
 import threading
 import subprocess
 import time
-import json
+import json, yaml
 import os
 import socket
 import numpy as np
@@ -216,30 +216,70 @@ def camera_calibration_flow(stdscr, ros_node):
     stdscr.refresh()
 
     # 1. Turn off IR Emitter
-    stdscr.addstr(3, 2, "[1/5] Disabling IR Emitter...")
+    stdscr.addstr(3, 2, "[1/6] Disabling IR Emitter, enabling IR Stream...")
     stdscr.refresh()
     # Using ROS 2 CLI via subprocess for reliable synchronous parameter setting
     subprocess.run(["ros2", "param", "set", selected_cam, "depth_module.emitter_enabled", "0"], capture_output=True)
+    subprocess.run(["ros2", "param", "set", selected_cam, "enable_infra1", "true"], capture_output=True)
+
+    stdscr.addstr(4, 2, "[2/6] Publishing Tag static transforms...")
+    stdscr.refresh()
+    
+    calibrations_path = "/tmp/calibrations"
+    yaml_path = f"{calibrations_path}/tags.yaml"  # Make sure this matches your container mount path
+    tag_tf_processes = []
+    
+    try:
+        with open(yaml_path, 'r') as f:
+            tags_config = yaml.safe_load(f)
+            
+        family = tags_config.get('apriltag', {}).get('ros__parameters', {}).get('family', '36h11')
+        positions = tags_config.get('apriltag', {}).get('ros__parameters', {}).get('positions', {})
+        
+        for tag_id, coords in positions.items():
+            frame_id = f"tag{family}:{tag_id}"
+            
+            cmd = [
+                "ros2", "run", "tf2_ros", "static_transform_publisher",
+                "--x", str(coords.get('X', 0.0)),
+                "--y", str(coords.get('Y', 0.0)),
+                "--z", str(coords.get('Z', 0.0)),
+                "--roll", str(coords.get('ROLL', 0.0)),
+                "--pitch", str(coords.get('PITCH', 0.0)),
+                "--yaw", str(coords.get('YAW', 0.0)),
+                "--frame-id", frame_id,
+                "--child-frame-id", "sandbox_origin"
+            ]
+            # Spawn in background
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            tag_tf_processes.append(proc)
+            
+    except Exception as e:
+        stdscr.addstr(5, 2, f"YAML Error: {str(e)}", curses.A_STANDOUT)
+        stdscr.getch()
+        return
 
     # 2. Start AprilTag Node
-    stdscr.addstr(4, 2, "[2/5] Starting AprilTag Detector...")
+    stdscr.addstr(5, 2, "[3/6] Starting AprilTag Detector...")
     stdscr.refresh()
     
     apriltag_cmd = [
         "ros2", "run", "apriltag_ros", "apriltag_node",
         "--ros-args",
-        "-r", f"image_rect:={selected_cam}/color/image_raw",
-        "-r", f"camera_info:={selected_cam}/color/camera_info",
-        "--params-file", "/tmp/tags.yaml" # Ensure this is mounted in your container
+        "-r", f"image_rect:={selected_cam}/infra1/image_rect_raw",
+        "-r", f"camera_info:={selected_cam}/infra1/camera_info",
+        "--params-file", yaml_path 
     ]
     tag_process = subprocess.Popen(apriltag_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # 3. Wait for TF
-    stdscr.addstr(5, 2, "[3/5] Waiting for AprilTag Transform (sandbox_origin -> camera_link)...")
-    stdscr.refresh()
-    
+
     # Extract just the camera name for the TF frame (e.g., cam_1234_link)
     cam_frame = f"{selected_cam.split('/')[-1]}_link" 
+
+    stdscr.addstr(6, 2, f"[4/6] Waiting for AprilTag Transform (sandbox_origin -> {cam_frame})...")
+    stdscr.refresh()
+    
     transform = None
     
     for _ in range(150): # 15 second timeout (150 * 0.1s)
@@ -249,17 +289,22 @@ def camera_calibration_flow(stdscr, ros_node):
         time.sleep(0.1)
 
     # 4. Clean up & Save
-    stdscr.addstr(6, 2, "[4/5] Stopping Detector and restoring IR Emitter...")
+    stdscr.addstr(7, 2, "[5/6] Cleaning up nodes, restoring IR Emitter and disabling IR Stream...")
     stdscr.refresh()
     tag_process.terminate()
     subprocess.run(["ros2", "param", "set", selected_cam, "depth_module.emitter_enabled", "1"], capture_output=True)
+    subprocess.run(["ros2", "param", "set", selected_cam, "enable_infra1", "false"], capture_output=True)
 
-    stdscr.addstr(7, 2, "[5/5] Processing Results...")
+    # Kill all static TF publishers
+    for proc in tag_tf_processes:
+        proc.terminate()
+
+    stdscr.addstr(8, 2, "[6/6] Processing Results...")
     stdscr.refresh()
 
     if transform:
-        os.makedirs("tf_configs", exist_ok=True)
-        out_file = f"tf_configs/{cam_frame}.json"
+        os.makedirs(f"{calibrations_path}/tf_configs", exist_ok=True)
+        out_file = f"{calibrations_path}/tf_configs/{cam_frame}.json"
         data = {
             "x": transform.translation.x, "y": transform.translation.y, "z": transform.translation.z,
             "qx": transform.rotation.x, "qy": transform.rotation.y, "qz": transform.rotation.z, "qw": transform.rotation.w
@@ -267,11 +312,14 @@ def camera_calibration_flow(stdscr, ros_node):
         with open(out_file, 'w') as f:
             json.dump(data, f, indent=4)
             
-        stdscr.addstr(9, 2, f"SUCCESS! Transform saved to {out_file}", curses.color_pair(1) if curses.has_colors() else curses.A_BOLD)
-    else:
-        stdscr.addstr(9, 2, "FAILED! Timeout waiting for AprilTag TF. Is the tag visible?", curses.A_STANDOUT)
+        stdscr.addstr(10, 2, f"SUCCESS! Transform saved to {out_file}", curses.color_pair(1) if curses.has_colors() else curses.A_BOLD)
+        stdscr.refresh()
 
-    stdscr.addstr(11, 2, "Press any key to return to menu.")
+    else:
+        stdscr.addstr(10, 2, "FAILED! Timeout waiting for AprilTag TF. Is the tag visible?", curses.A_STANDOUT)
+        stdscr.refresh()
+
+    stdscr.addstr(12, 2, "Press any key to return to menu.")
     stdscr.getch()
 
 def projector_calibration_flow(stdscr, ros_node):
@@ -361,12 +409,13 @@ def projector_calibration_flow(stdscr, ros_node):
         sock.sendto(json.dumps(payload).encode(), (udp_ip, udp_port))
         
         # Save to Disk
-        os.makedirs("tf_configs", exist_ok=True)
-        out_file = f"tf_configs/projector_{proj_id}.json"
+        os.makedirs(f"{calibrations_path}/tf_configs", exist_ok=True)
+        out_file = f"{calibrations_path}/tf_configs/projector_{proj_id}.json"
         with open(out_file, 'w') as f:
             json.dump(results, f, indent=4)
             
         stdscr.addstr(10, 2, f"SUCCESS! Calibration saved to {out_file}", curses.A_BOLD)
+
 
     stdscr.addstr(12, 2, "Press any key to return to menu.")
     stdscr.getch()

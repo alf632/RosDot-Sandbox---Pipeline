@@ -21,6 +21,7 @@ services:
     volumes:
       - /dev:/dev
       - ./config.json:/config/sandbox.json:ro
+      - ./calibrations:/tmp/calibrations
     depends_on:
       - component_container
     command: >
