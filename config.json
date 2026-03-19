@@ -6,11 +6,11 @@
     },
     {
       "name": "merger",
-      "loaders": ["merger_loader", "tf_loader"]
+      "loaders": ["merger_loader", "tf_loader", "godot_loader"]
     },
     {
       "name": "all",
-      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "tf_loader"]
+      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "tf_loader", "godot_loader"]
     }
   ],
   "loader_settings": {
@@ -27,6 +27,11 @@
     },
     "tf_loader": {
       "config_dir": "/tmp/calibrations/tf_configs"
+    },
+    "godot_loader": {
+      "config_dir": "/tmp/calibrations",
+      "godot_ip": "127.0.0.1",
+      "godot_port": 5007
     }
   }
 }

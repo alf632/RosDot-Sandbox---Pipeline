@@ -10,6 +10,7 @@ import os
 import socket
 import numpy as np
 import cv2
+import base64
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped
@@ -322,21 +323,53 @@ def camera_calibration_flow(stdscr, ros_node):
     stdscr.addstr(12, 2, "Press any key to return to menu.")
     stdscr.getch()
 
+
 def projector_calibration_flow(stdscr, ros_node):
     stdscr.clear()
     stdscr.addstr(1, 2, "--- Projector Calibration ---", curses.A_BOLD)
+
+    calibrations_path = "/tmp/calibrations"
+    yaml_path = f"{calibrations_path}/projectors.yml"
     
-    # 1. Pick Projector
-    stdscr.addstr(3, 2, "Enter Projector ID to calibrate (1-4, or 'q' to cancel): ")
+    # 1. Read projectors.yml to dynamically get valid IDs, IPs, and Resolutions
+    projector_configs = {}
+    try:
+        with open(yaml_path, 'r') as f:
+            projectors = yaml.safe_load(f)
+            # Handle the dicts format: 1: {resolution: ..., target_ip: ...}
+            for pid in projectors.keys():
+                projector_configs[str(pid)] = projectors[pid]
+    except Exception as e:
+        stdscr.addstr(3, 2, f"Error reading tf_configs/projectors.yml: {e}", curses.A_STANDOUT)
+        stdscr.addstr(5, 2, "Press any key to return.")
+        stdscr.getch()
+        return
+        
+    if not projector_configs:
+        stdscr.addstr(3, 2, "No projectors defined in projectors.yml!", curses.A_STANDOUT)
+        stdscr.addstr(5, 2, "Press any key to return.")
+        stdscr.getch()
+        return
+
+    valid_ids = list(projector_configs.keys())
+    options_str = ", ".join(valid_ids)
+
+    # 2. Pick Projector dynamically
+    stdscr.addstr(3, 2, f"Enter Projector ID to calibrate ({options_str}, or 'q' to cancel): ")
     stdscr.refresh()
+    
     while True:
         key = stdscr.getch()
         if key == ord('q'): return
-        if ord('1') <= key <= ord('4'):
-            proj_id = chr(key)
-            break
+        try:
+            char_key = chr(key)
+            if char_key in valid_ids:
+                proj_id = char_key
+                break
+        except ValueError:
+            pass # Ignore non-character keypresses
 
-    # 2. Pick Camera
+    # 3. Pick Camera
     cameras = ros_node.get_available_cameras()
     if not cameras:
         stdscr.addstr(5, 2, "No cameras found! Press any key to return.")
@@ -355,28 +388,69 @@ def projector_calibration_flow(stdscr, ros_node):
             selected_cam = cameras[idx]
             break
 
-    # 3. Setup UDP to Godot
-    udp_ip = "127.0.0.1" # Change to your Godot IP
-    udp_port = 5006
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
+    # 4. Extract Network & Resolution Configs (No second file read needed!)
     stdscr.clear()
     stdscr.addstr(1, 2, f"Calibrating Projector {proj_id} via {selected_cam}", curses.A_BOLD)
-    stdscr.addstr(3, 2, "[1/4] Instructing Godot to display ChArUco board...")
+    stdscr.addstr(3, 2, "[1/4] Generating ChArUco board from config...")
     stdscr.refresh()
-    sock.sendto(json.dumps({"command": "show_charuco", "projector": proj_id}).encode(), (udp_ip, udp_port))
-    time.sleep(1.0)
 
-    # 4. Start Point Collection
-    stdscr.addstr(4, 2, "[2/4] Collecting ChArUco 3D points...")
+    godot_ip = "127.0.0.1"
+    godot_port = 5007
+    
+    # Get Godot's TCP Receiver IP/Port from config.json
+    try:
+        with open("/ros2_ws/config.json", "r") as f:
+            main_cfg = json.load(f)
+            godot_ip = main_cfg.get("godot_loader", {}).get("godot_ip", godot_ip)
+            godot_port = main_cfg.get("godot_loader", {}).get("godot_port", godot_port)
+    except:
+        pass
+        
+    # Get the specific projector's resolution from our pre-loaded dictionary
+    res_str = projector_configs[proj_id].get('resolution', '1920x1080')
+    width = int(res_str.split('x')[0])
+    height = int(res_str.split('x')[1])
+
+    # 4. Generate the exact ChArUco Board & Encode to Base64
+    # (Uses the OpenCV 4.6 syntax from our CalibrationCore)
+    board_img = ros_node.charuco_board.draw((width, height))
+    _, buffer = cv2.imencode('.png', board_img)
+    b64_img = base64.b64encode(buffer).decode('utf-8')
+
+    # 5. Send to Godot via TCP
+    stdscr.addstr(5, 2, f"[2/4] Instructing Godot ({godot_ip}:{godot_port}) to display board...")
+    stdscr.refresh()
+    
+    payload = {
+        "command": "calibrate_projector", 
+        "projector_id": str(proj_id), 
+        "image_b64": b64_img
+    }
+    
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(3.0)
+            s.connect((godot_ip, godot_port))
+            s.sendall(json.dumps(payload).encode('utf-8'))
+    except Exception as e:
+        stdscr.addstr(7, 2, f"FAILED! Could not reach Godot: {e}", curses.A_STANDOUT)
+        stdscr.addstr(9, 2, "Press any key to return.")
+        stdscr.getch()
+        return
+
+    # Wait a second for Godot to render the texture and the camera to adjust exposure
+    time.sleep(1.5) 
+
+    # 6. Start Live Point Collection
+    stdscr.addstr(7, 2, "[3/4] Collecting ChArUco 3D points...")
     ros_node.start_projector_calibration(selected_cam)
     
-    stdscr.nodelay(True) # Make getch non-blocking for live updates
+    stdscr.nodelay(True) # Make getch non-blocking for live UI
     target_points = 50
     
     while True:
         pts = len(ros_node.all_3d_world_points)
-        stdscr.addstr(5, 6, f"Points collected: {pts} / {target_points}  (Press 'q' to abort)")
+        stdscr.addstr(8, 6, f"Points collected: {pts} / {target_points}  (Press 'q' to abort)")
         stdscr.refresh()
         
         if pts >= target_points:
@@ -393,31 +467,27 @@ def projector_calibration_flow(stdscr, ros_node):
     stdscr.nodelay(False) # Revert to blocking
     ros_node.stop_projector_calibration()
 
-    # 5. Solve Matrix
-    stdscr.addstr(7, 2, "[3/4] Solving Projector Intrinsics & Extrinsics...")
+    # 7. Solve Matrix
+    stdscr.addstr(10, 2, "[4/4] Solving Projector Intrinsics & Extrinsics...")
     stdscr.refresh()
     
-    results = ros_node.solve_projector_matrix()
+    # The math solver handles OpenCV arrays -> Godot Basis conversion so the JSON is ready to use
+    results = ros_node.solve_projector_matrix() 
+    
     if not results:
-        stdscr.addstr(9, 2, "FAILED! OpenCV could not solve the matrix.", curses.A_STANDOUT)
+        stdscr.addstr(12, 2, "FAILED! OpenCV could not solve the matrix.", curses.A_STANDOUT)
     else:
-        # 6. Save and Transmit
-        stdscr.addstr(8, 2, "[4/4] Sending data to Godot and saving to disk...")
+        # 8. Save to Disk (Triggering the GodotLoader automatically)
+        os.makedirs("tf_configs", exist_ok=True)
+        out_file = f"tf_configs/projector_{proj_id}.json"
         
-        # Send to Godot
-        payload = {"command": "set_calibration", "projector": proj_id, "data": results}
-        sock.sendto(json.dumps(payload).encode(), (udp_ip, udp_port))
-        
-        # Save to Disk
-        os.makedirs(f"{calibrations_path}/tf_configs", exist_ok=True)
-        out_file = f"{calibrations_path}/tf_configs/projector_{proj_id}.json"
         with open(out_file, 'w') as f:
             json.dump(results, f, indent=4)
             
-        stdscr.addstr(10, 2, f"SUCCESS! Calibration saved to {out_file}", curses.A_BOLD)
+        stdscr.addstr(12, 2, f"SUCCESS! Math saved to {out_file}", curses.A_BOLD)
+        stdscr.addstr(13, 2, "(The Operator has automatically forwarded this to Godot).")
 
-
-    stdscr.addstr(12, 2, "Press any key to return to menu.")
+    stdscr.addstr(15, 2, "Press any key to return to menu.")
     stdscr.getch()
 
 def main(args=None):

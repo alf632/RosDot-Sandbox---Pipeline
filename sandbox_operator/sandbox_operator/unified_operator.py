@@ -11,6 +11,7 @@ from .loaders.realsense_loader import RealSenseLoader
 from .loaders.reprojector_loader import ReprojectorLoader
 from .loaders.merger_loader import MergerLoader
 from .loaders.tf_loader import TfLoader
+from .loaders.godot_loader import GodotLoader
 
 class UnifiedOperator(Node):
     def __init__(self):
@@ -44,7 +45,8 @@ class UnifiedOperator(Node):
             "realsense_loader": RealSenseLoader(),
             "repro_loader": ReprojectorLoader(),
             "merger_loader": MergerLoader(),
-            "tf_loader": TfLoader()
+            "tf_loader": TfLoader(),
+            "godot_loader": GodotLoader()
         }
 
         if self.is_controller:

@@ -1,1 +1,1 @@
-ffplay -fflags nobuffer -flags low_delay -framedrop rtp://192.168.1.150:5004
+ffplay -fflags nobuffer -flags low_delay -framedrop udp://127.0.0.1:5004
