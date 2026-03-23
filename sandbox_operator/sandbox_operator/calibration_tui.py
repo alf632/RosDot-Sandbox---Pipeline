@@ -12,9 +12,11 @@ import numpy as np
 import cv2
 import base64
 
+from std_msgs.msg import String
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped
 from cv_bridge import CvBridge
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 import message_filters
 from image_geometry import PinholeCameraModel
 import tf2_geometry_msgs  # Requires: sudo apt install ros-jazzy-tf2-geometry-msgs
@@ -26,12 +28,16 @@ class CalibrationCore(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.bridge = CvBridge()
-        
+
         # Projector Calibration State
         self.is_calibrating_proj = False
         self.all_3d_world_points = []
         self.all_2d_godot_pixels = []
         self.subs = [] # Hold dynamically created subscribers
+
+        # Projector discovery state (populated from /projectors/* topics)
+        self.discovered_projectors = {}  # topic_name -> {width, height, target_ip, target_port}
+        self._projector_subs = {}  # topic_name -> subscription
 
         # Godot ChArUco Board Definition
         self.proj_width = 1920
@@ -61,6 +67,33 @@ class CalibrationCore(Node):
                 if len(parts) >= 3:
                     cameras.add(f"/{parts[1]}/{parts[2]}")
         return list(cameras)
+
+    def discover_projectors(self):
+        """Subscribe to any new /projectors/* topics and return current map."""
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
+        for topic_name, _ in self.get_topic_names_and_types():
+            if topic_name.startswith('/projectors/') and topic_name not in self._projector_subs:
+                sub = self.create_subscription(
+                    String, topic_name,
+                    lambda msg, t=topic_name: self._on_projector(t, msg),
+                    qos
+                )
+                self._projector_subs[topic_name] = sub
+        return dict(self.discovered_projectors)
+
+    def _on_projector(self, topic_name, msg):
+        try:
+            self.discovered_projectors[topic_name] = json.loads(msg.data)
+        except json.JSONDecodeError:
+            pass
+
+    def get_projector_id(self, topic_name):
+        """Get the stable string ID from the projector's topic payload."""
+        return self.discovered_projectors[topic_name]["projector_id"]
 
     def get_tf(self, target_frame, source_frame):
         try:
@@ -328,57 +361,53 @@ def projector_calibration_flow(stdscr, ros_node):
     stdscr.clear()
     stdscr.addstr(1, 2, "--- Projector Calibration ---", curses.A_BOLD)
 
-    calibrations_path = "/tmp/calibrations"
-    yaml_path = f"{calibrations_path}/projectors.yml"
-    
-    # 1. Read projectors.yml to dynamically get valid IDs, IPs, and Resolutions
-    projector_configs = {}
-    try:
-        with open(yaml_path, 'r') as f:
-            projectors = yaml.safe_load(f)
-            # Handle the dicts format: 1: {resolution: ..., target_ip: ...}
-            for pid in projectors.keys():
-                projector_configs[str(pid)] = projectors[pid]
-    except Exception as e:
-        stdscr.addstr(3, 2, f"Error reading tf_configs/projectors.yml: {e}", curses.A_STANDOUT)
-        stdscr.addstr(5, 2, "Press any key to return.")
-        stdscr.getch()
-        return
-        
-    if not projector_configs:
-        stdscr.addstr(3, 2, "No projectors defined in projectors.yml!", curses.A_STANDOUT)
-        stdscr.addstr(5, 2, "Press any key to return.")
-        stdscr.getch()
-        return
-
-    valid_ids = list(projector_configs.keys())
-    options_str = ", ".join(valid_ids)
-
-    # 2. Pick Projector dynamically
-    stdscr.addstr(3, 2, f"Enter Projector ID to calibrate ({options_str}, or 'q' to cancel): ")
+    # 1. Discover projectors from /projectors/* topics
+    stdscr.addstr(3, 2, "Scanning for active projectors...")
     stdscr.refresh()
-    
+
+    # Give transient_local messages a moment to arrive
+    ros_node.discover_projectors()
+    time.sleep(1.0)
+    projectors = ros_node.discover_projectors()
+
+    if not projectors:
+        stdscr.addstr(5, 2, "No projectors found on /projectors/* topics!", curses.A_STANDOUT)
+        stdscr.addstr(6, 2, "Is a projector_loader running?")
+        stdscr.addstr(8, 2, "Press any key to return.")
+        stdscr.getch()
+        return
+
+    sorted_topics = sorted(projectors.keys())
+    stdscr.addstr(5, 2, "Available Projectors:")
+    for i, topic in enumerate(sorted_topics):
+        info = projectors[topic]
+        stdscr.addstr(6 + i, 4, f"{i + 1}. {info['projector_id']}  ({info['width']}x{info['height']})")
+    stdscr.addstr(8 + len(sorted_topics), 2, "Select projector number (or 'q' to cancel): ")
+    stdscr.refresh()
+
+    # 2. Pick Projector
     while True:
         key = stdscr.getch()
         if key == ord('q'): return
-        try:
-            char_key = chr(key)
-            if char_key in valid_ids:
-                proj_id = char_key
-                break
-        except ValueError:
-            pass # Ignore non-character keypresses
+        idx = key - ord('1')
+        if 0 <= idx < len(sorted_topics):
+            selected_topic = sorted_topics[idx]
+            break
+
+    proj_info = projectors[selected_topic]
+    proj_id = ros_node.get_projector_id(selected_topic)
 
     # 3. Pick Camera
     cameras = ros_node.get_available_cameras()
     if not cameras:
-        stdscr.addstr(5, 2, "No cameras found! Press any key to return.")
+        stdscr.addstr(10 + len(sorted_topics), 2, "No cameras found! Press any key to return.")
         stdscr.getch()
         return
 
-    stdscr.addstr(5, 2, "Select observation camera:")
+    stdscr.clear()
+    stdscr.addstr(1, 2, "Select observation camera:")
     for i, cam in enumerate(cameras):
-        stdscr.addstr(6 + i, 4, f"{i + 1}. {cam}")
+        stdscr.addstr(2 + i, 4, f"{i + 1}. {cam}")
     stdscr.refresh()
 
     while True:
@@ -388,7 +417,7 @@ def projector_calibration_flow(stdscr, ros_node):
             selected_cam = cameras[idx]
             break
 
-    # 4. Extract Network & Resolution Configs (No second file read needed!)
+    # 4. Extract Network & Resolution Configs
     stdscr.clear()
     stdscr.addstr(1, 2, f"Calibrating Projector {proj_id} via {selected_cam}", curses.A_BOLD)
     stdscr.addstr(3, 2, "[1/4] Generating ChArUco board from config...")
@@ -396,20 +425,19 @@ def projector_calibration_flow(stdscr, ros_node):
 
     godot_ip = "127.0.0.1"
     godot_port = 5007
-    
+
     # Get Godot's TCP Receiver IP/Port from config.json
     try:
         with open("/ros2_ws/config.json", "r") as f:
             main_cfg = json.load(f)
-            godot_ip = main_cfg.get("godot_loader", {}).get("godot_ip", godot_ip)
-            godot_port = main_cfg.get("godot_loader", {}).get("godot_port", godot_port)
-    except:
+            godot_cfg = main_cfg.get("loader_settings", {}).get("godot_loader", {})
+            godot_ip = godot_cfg.get("godot_ip", godot_ip)
+            godot_port = godot_cfg.get("godot_port", godot_port)
+    except Exception:
         pass
-        
-    # Get the specific projector's resolution from our pre-loaded dictionary
-    res_str = projector_configs[proj_id].get('resolution', '1920x1080')
-    width = int(res_str.split('x')[0])
-    height = int(res_str.split('x')[1])
+
+    width = proj_info['width']
+    height = proj_info['height']
 
     # 4. Generate the exact ChArUco Board & Encode to Base64
     # (Uses the OpenCV 4.6 syntax from our CalibrationCore)
@@ -478,13 +506,14 @@ def projector_calibration_flow(stdscr, ros_node):
         stdscr.addstr(12, 2, "FAILED! OpenCV could not solve the matrix.", curses.A_STANDOUT)
     else:
         # 8. Save to Disk (Triggering the GodotLoader automatically)
-        os.makedirs("tf_configs", exist_ok=True)
-        out_file = f"tf_configs/projector_{proj_id}.json"
-        
+        calibrations_path = "/tmp/calibrations"
+        os.makedirs(f"{calibrations_path}/tf_configs", exist_ok=True)
+        out_file = f"{calibrations_path}/tf_configs/projector_{proj_id}.json"
+
         with open(out_file, 'w') as f:
             json.dump(results, f, indent=4)
-            
-        stdscr.addstr(12, 2, f"SUCCESS! Math saved to {out_file}", curses.A_BOLD)
+
+        stdscr.addstr(12, 2, f"SUCCESS! Saved to {out_file}", curses.A_BOLD)
         stdscr.addstr(13, 2, "(The Operator has automatically forwarded this to Godot).")
 
     stdscr.addstr(15, 2, "Press any key to return to menu.")

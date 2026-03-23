@@ -9,8 +9,12 @@
       "loaders": ["merger_loader", "streamer_loader", "tf_loader", "godot_loader"]
     },
     {
+      "name": "projector",
+      "loaders": ["projector_loader"]
+    },
+    {
       "name": "all",
-      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "streamer_loader", "tf_loader", "godot_loader"]
+      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "streamer_loader", "tf_loader", "godot_loader", "projector_loader"]
     }
   ],
   "loader_settings": {
@@ -27,6 +31,11 @@
       "udp_ip": "127.0.0.1",
       "udp_port": 4242
     },
+    "projector_loader": {
+      "base_udp_port": 5004,
+      "display_backend": "drm",
+      "displays": []
+    },
     "tf_loader": {
       "config_dir": "/tmp/calibrations/tf_configs"
     },
@@ -34,6 +43,14 @@
       "config_dir": "/tmp/calibrations",
       "godot_ip": "127.0.0.1",
       "godot_port": 5007
+    }
+  },
+  "host_settings": {
+    "malf_legion": {
+      "projector_loader": {
+        "display_backend": "hyprland",
+        "displays": ["eDP-1"]
+      }
     }
   }
 }

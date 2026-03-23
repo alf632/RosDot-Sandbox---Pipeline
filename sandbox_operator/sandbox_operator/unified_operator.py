@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+import copy
 import json
 import socket
 from composition_interfaces.srv import LoadNode
@@ -13,26 +14,30 @@ from .loaders.merger_loader import MergerLoader
 from .loaders.tf_loader import TfLoader
 from .loaders.godot_loader import GodotLoader
 from .loaders.streamer_loader import StreamerLoader
+from .loaders.projector_loader import ProjectorLoader
 
 class UnifiedOperator(Node):
     def __init__(self):
         super().__init__('unified_operator')
-        
+
         self.declare_parameter('role', 'perception')
         self.declare_parameter('is_controller', False)
         self.declare_parameter('config_file_path', '/config/sandbox.json')
 
-        self.role_name = self.get_parameter('role').value
+        # Support comma-separated roles: "perception,projector"
+        raw_role = self.get_parameter('role').value
+        self.role_names = [r.strip() for r in raw_role.split(',')]
         self.is_controller = self.get_parameter('is_controller').value
-        
+
         # Unique namespace for this physical device (e.g., "n97_node_1")
         self.device_namespace = f"/{socket.gethostname().replace('-', '_')}"
-        
+        self.hostname = socket.gethostname().replace('-', '_')
+
         # Build the targeted service string
         target_service = f"{self.device_namespace}/ComponentManager/_container/load_node"
-        
+
         self.get_logger().info(f"Connecting to local container at: {target_service}")
-        
+
         # Now this client will ONLY talk to the container running on this specific N97
         self.client = self.create_client(LoadNode, target_service)
 
@@ -48,32 +53,60 @@ class UnifiedOperator(Node):
             "merger_loader": MergerLoader(),
             "tf_loader": TfLoader(),
             "godot_loader": GodotLoader(),
-            "streamer_loader": StreamerLoader()
+            "streamer_loader": StreamerLoader(),
+            "projector_loader": ProjectorLoader()
         }
 
         if self.is_controller:
             self.create_timer(2.0, self.broadcast_config)
             self.publisher_ = self.create_publisher(String, '/config/sandbox_setup', 10)
-            self.get_logger().info(f"Running as CONTROLLER. Device NS: {self.device_namespace}")
+            self.get_logger().info(f"Running as CONTROLLER. Roles: {self.role_names}. Device NS: {self.device_namespace}")
         else:
-            self.get_logger().info(f"Waiting for CONTROLLER. Device NS: {self.device_namespace}")
+            self.get_logger().info(f"Waiting for CONTROLLER. Roles: {self.role_names}. Device NS: {self.device_namespace}")
 
         self.create_subscription(String, '/config/sandbox_setup', self.config_callback, 10)
 
     def config_callback(self, msg):
         try:
             config = json.loads(msg.data)
-            role_def = next((r for r in config['roles'] if r['name'] == self.role_name), None)
-            if not role_def:
+
+            # Collect loaders from all matching roles (deduplicated, order-preserved)
+            all_loaders = []
+            seen = set()
+            for role_name in self.role_names:
+                role_def = next((r for r in config['roles'] if r['name'] == role_name), None)
+                if not role_def:
+                    continue
+                for loader_key in role_def.get('loaders', []):
+                    if loader_key not in seen:
+                        all_loaders.append(loader_key)
+                        seen.add(loader_key)
+
+            if not all_loaders:
                 return
 
-            for loader_key in role_def.get('loaders', []):
+            # Merge host-specific settings over global loader_settings
+            settings = config.get('loader_settings', {})
+            host_overrides = config.get('host_settings', {}).get(self.hostname, {})
+            merged_settings = self._merge_settings(settings, host_overrides)
+
+            for loader_key in all_loaders:
                 if loader_key in self.loaders:
-                    self.loaders[loader_key].discover_and_load(self, config.get('loader_settings', {}))
+                    self.loaders[loader_key].discover_and_load(self, merged_settings)
                 else:
                     self.get_logger().error(f"Unknown loader requested: {loader_key}")
         except Exception as e:
             self.get_logger().error(f"Config parse error: {e}")
+
+    def _merge_settings(self, base, overrides):
+        """Deep-merge overrides into base. Returns new dict."""
+        result = copy.deepcopy(base)
+        for key, value in overrides.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._merge_settings(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
 
     def load_component(self, package, plugin, name, params, namespace="", use_ipc=False):
         # Prevent re-deploying the exact same node

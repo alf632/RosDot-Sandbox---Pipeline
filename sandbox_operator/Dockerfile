@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-message-filters \
     ros-jazzy-apriltag-ros \
     python3-opencv \
+    mpv \
     && rm -rf /var/lib/apt/lists/*
 
 # Install pyrealsense2 via pip
