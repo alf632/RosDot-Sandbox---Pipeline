@@ -6,11 +6,11 @@
     },
     {
       "name": "merger",
-      "loaders": ["merger_loader", "tf_loader", "godot_loader"]
+      "loaders": ["merger_loader", "streamer_loader", "tf_loader", "godot_loader"]
     },
     {
       "name": "all",
-      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "tf_loader", "godot_loader"]
+      "loaders": ["realsense_loader", "repro_loader", "merger_loader", "streamer_loader", "tf_loader", "godot_loader"]
     }
   ],
   "loader_settings": {
@@ -21,7 +21,9 @@
     "merger_loader": {
       "output_res": {"width": 256, "height": 256},
       "temporal_smoothing_factor": 5.0,
-      "temporal_min_alpha": 0.05,
+      "temporal_min_alpha": 0.05
+    },
+    "streamer_loader": {
       "udp_ip": "127.0.0.1",
       "udp_port": 4242
     },

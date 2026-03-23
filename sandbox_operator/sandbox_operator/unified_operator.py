@@ -12,6 +12,7 @@ from .loaders.reprojector_loader import ReprojectorLoader
 from .loaders.merger_loader import MergerLoader
 from .loaders.tf_loader import TfLoader
 from .loaders.godot_loader import GodotLoader
+from .loaders.streamer_loader import StreamerLoader
 
 class UnifiedOperator(Node):
     def __init__(self):
@@ -46,7 +47,8 @@ class UnifiedOperator(Node):
             "repro_loader": ReprojectorLoader(),
             "merger_loader": MergerLoader(),
             "tf_loader": TfLoader(),
-            "godot_loader": GodotLoader()
+            "godot_loader": GodotLoader(),
+            "streamer_loader": StreamerLoader()
         }
 
         if self.is_controller:
