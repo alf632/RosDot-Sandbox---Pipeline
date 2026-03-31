@@ -249,11 +249,11 @@ def camera_calibration_flow(stdscr, ros_node):
     stdscr.addstr(1, 2, f"Calibrating {selected_cam}", curses.A_BOLD)
     stdscr.refresh()
 
-    # 1. Turn off IR Emitter
-    stdscr.addstr(3, 2, "[1/6] Disabling IR Emitter, enabling IR Stream...")
+    # 1. Turn off IR Emitter on ALL cameras, enable IR stream on selected camera
+    stdscr.addstr(3, 2, "[1/6] Disabling IR Emitters on all cameras, enabling IR Stream...")
     stdscr.refresh()
-    # Using ROS 2 CLI via subprocess for reliable synchronous parameter setting
-    subprocess.run(["ros2", "param", "set", selected_cam, "depth_module.emitter_enabled", "0"], capture_output=True)
+    for cam in cameras:
+        subprocess.run(["ros2", "param", "set", cam, "depth_module.emitter_enabled", "0"], capture_output=True)
     subprocess.run(["ros2", "param", "set", selected_cam, "enable_infra1", "true"], capture_output=True)
 
     stdscr.addstr(4, 2, "[2/6] Publishing Tag static transforms...")
@@ -326,7 +326,8 @@ def camera_calibration_flow(stdscr, ros_node):
     stdscr.addstr(7, 2, "[5/6] Cleaning up nodes, restoring IR Emitter and disabling IR Stream...")
     stdscr.refresh()
     tag_process.terminate()
-    subprocess.run(["ros2", "param", "set", selected_cam, "depth_module.emitter_enabled", "1"], capture_output=True)
+    for cam in cameras:
+        subprocess.run(["ros2", "param", "set", cam, "depth_module.emitter_enabled", "1"], capture_output=True)
     subprocess.run(["ros2", "param", "set", selected_cam, "enable_infra1", "false"], capture_output=True)
 
     # Kill all static TF publishers
