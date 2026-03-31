@@ -25,7 +25,9 @@ class ProjectorLoader:
     def discover_and_load(self, operator, config):
         cfg = config.get('projector_loader', {})
         target_displays = cfg.get('displays', [])
+        operator.get_logger().debug(f"projector_loader: loaded. config={cfg}")
         if not target_displays:
+            operator.get_logger().debug("projector_loader: no displays configured, skipping")
             return
 
         backend = cfg.get('display_backend', 'drm')
@@ -38,6 +40,9 @@ class ProjectorLoader:
         hostname = socket.gethostname().replace('-', '_')
 
         connected = self._discover_displays()
+        operator.get_logger().debug(f"projector_loader: DRM connectors found: {list(connected.keys())}")
+        if not connected:
+            operator.get_logger().warn("projector_loader: no connected displays found in /sys/class/drm/")
 
         for i, connector in enumerate(target_displays):
             if connector not in connected:

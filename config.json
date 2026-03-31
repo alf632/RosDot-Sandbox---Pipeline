@@ -2,7 +2,7 @@
   "roles": [
     {
       "name": "perception",
-      "loaders": ["realsense_loader", "repro_loader"]
+      "loaders": ["realsense_loader", "repro_loader", "projector_loader"]
     },
     {
       "name": "merger",
@@ -46,10 +46,10 @@
     }
   },
   "host_settings": {
-    "malf_legion": {
+    "odroid-h4plus": {
       "projector_loader": {
-        "display_backend": "hyprland",
-        "displays": ["eDP-1"]
+        "display_backend": "drm",
+        "displays": ["HDMI-A-1"]
       }
     }
   }
