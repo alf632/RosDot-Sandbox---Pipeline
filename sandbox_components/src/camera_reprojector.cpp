@@ -140,8 +140,8 @@ private:
                         if (d_row[u] == 0) continue;
                         float z = d_row[u] * 0.001f;
                         Eigen::Vector3f p = tf * Eigen::Vector3f(l_row[u][0] * z, l_row[u][1] * z, z);
-                        int gx = ((p.x() / sb_w) + 0.5f) * out_w;
-                        int gy = ((p.y() / sb_l) + 0.5f) * out_h;
+                        int gx = cvRound(((p.x() / sb_w) + 0.5f) * out_w);
+                        int gy = cvRound(((p.y() / sb_l) + 0.5f) * out_h);
                         if (gx >= 0 && gx < out_w && gy >= 0 && gy < out_h) {
                             float* ptr = (float*)cam_data.ptr(gy, gx);
                             ptr[0] += p.z();

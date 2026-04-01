@@ -3,7 +3,8 @@ import json
 import glob
 import numpy as np
 from geometry_msgs.msg import TransformStamped
-from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+from tf2_msgs.msg import TFMessage
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
 class TfLoader:
     def __init__(self):
@@ -12,12 +13,19 @@ class TfLoader:
 
     def discover_and_load(self, operator, config):
         cfg = config.get('tf_loader', {})
-        config_dir = cfg.get('config_dir', 'tf_configs') 
-        
-        # Attach a Static Broadcaster to the Operator if it doesn't have one
-        if not hasattr(operator, 'static_tf_broadcaster'):
-            operator.static_tf_broadcaster = StaticTransformBroadcaster(operator)
-            
+        config_dir = cfg.get('config_dir', 'tf_configs')
+
+        # Use a direct publisher on /tf_static with KeepLast(1) so updates
+        # replace the previous message instead of accumulating stale transforms.
+        if not hasattr(operator, '_tf_static_pub'):
+            qos = QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST
+            )
+            operator._tf_static_pub = operator.create_publisher(TFMessage, '/tf_static', qos)
+
         search_path = os.path.join(config_dir, '*.json')
         current_files = glob.glob(search_path)
         
@@ -83,7 +91,7 @@ class TfLoader:
                 
         # 3. Broadcast and update state
         if transforms:
-            operator.static_tf_broadcaster.sendTransform(transforms)
+            operator._tf_static_pub.publish(TFMessage(transforms=transforms))
             operator.get_logger().info(f"Detected TF changes! Broadcasted {len(transforms)} static transforms.")
             self.known_files = new_known_files # Lock in the new state
 

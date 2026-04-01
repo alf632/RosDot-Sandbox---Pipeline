@@ -46,7 +46,7 @@
     }
   },
   "host_settings": {
-    "odroid-h4plus": {
+    "odroid_h4plus": {
       "projector_loader": {
         "display_backend": "drm",
         "displays": ["HDMI-A-1"]

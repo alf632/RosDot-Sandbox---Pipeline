@@ -31,7 +31,8 @@ class UnifiedOperator(Node):
 
         # Unique namespace for this physical device (e.g., "n97_node_1")
         self.device_namespace = f"/{socket.gethostname().replace('-', '_')}"
-        self.hostname = socket.gethostname().replace('-', '_')
+        self.hostname = socket.gethostname()
+        self.hostname_sanitized = self.hostname.replace('-', '_')
 
         # Build the targeted service string
         target_service = f"{self.device_namespace}/ComponentManager/_container/load_node"
