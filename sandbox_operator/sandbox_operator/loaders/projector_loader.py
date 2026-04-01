@@ -27,7 +27,7 @@ class ProjectorLoader:
         target_displays = cfg.get('displays', [])
         operator.get_logger().debug(f"projector_loader: loaded. config={cfg}")
         if not target_displays:
-            operator.get_logger().debug("projector_loader: no displays configured, skipping")
+            operator.get_logger().warn("projector_loader: no displays configured, skipping")
             return
 
         backend = cfg.get('display_backend', 'drm')

@@ -88,7 +88,7 @@ class UnifiedOperator(Node):
 
             # Merge host-specific settings over global loader_settings
             settings = config.get('loader_settings', {})
-            host_overrides = config.get('host_settings', {}).get(self.hostname, {})
+            host_overrides = config.get('host_settings', {}).get(self.hostname_sanitized, {})
             merged_settings = self._merge_settings(settings, host_overrides)
 
             for loader_key in all_loaders:
