@@ -16,6 +16,8 @@ public:
     : Node("heightmap_streamer", rclcpp::NodeOptions(options).use_intra_process_comms(true)) {
         this->declare_parameter("udp_ip", "127.0.0.1");
         this->declare_parameter("udp_port", 5005);
+        this->declare_parameter("z_offset", 0.25);
+        this->declare_parameter("z_range", 0.50);
 
         sock_ = socket(AF_INET, SOCK_DGRAM, 0);
         int send_buff = 1024 * 1024;
@@ -36,9 +38,10 @@ private:
         try {
             cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, "32FC1");
             cv::Mat gray_img;
-            
-            // Map [-0.25, 0.25] to [0, 255]
-            float offset = 0.25f, range = 0.50f;
+
+            float offset = this->get_parameter("z_offset").as_double();
+            float range  = this->get_parameter("z_range").as_double();
+            // Map [-offset, range-offset] to [0, 255]
             float alpha = 255.0f / range, beta = offset * alpha;
             cv_ptr->image.convertTo(gray_img, CV_8UC1, alpha, beta);
 

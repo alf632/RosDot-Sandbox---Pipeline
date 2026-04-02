@@ -138,6 +138,8 @@ class CalibrationCore(Node):
             self.destroy_subscription(sub.sub)
         self.subs.clear()
         self._syncs.clear()
+        self._no_marker_frames = 0
+        self._few_charuco_frames = 0
 
         # Sandbox geometry for heightmap lookup
         sandbox = sandbox_config.get('sandbox', {})
@@ -223,6 +225,10 @@ class CalibrationCore(Node):
 
         marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(cv_rgb, self.aruco_dict)
         if marker_ids is None or len(marker_ids) == 0:
+            self._no_marker_frames += 1
+            if self._no_marker_frames % 30 == 1:
+                h, w = cv_rgb.shape[:2]
+                self._debug_log(f"[{frame_id.split('/')[-1]}] No ArUco markers in {self._no_marker_frames} frames (img {w}x{h})")
             return
 
         retval, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
@@ -230,6 +236,9 @@ class CalibrationCore(Node):
         )
         n_charuco = len(charuco_corners) if charuco_corners is not None else 0
         if charuco_corners is None or n_charuco <= 6:
+            self._few_charuco_frames += 1
+            if self._few_charuco_frames % 10 == 1:
+                self._debug_log(f"[{frame_id.split('/')[-1]}] {len(marker_ids)} ArUco markers but only {n_charuco} ChArUco corners (need >6)")
             return
 
         cam_model = PinholeCameraModel()

@@ -29,7 +29,9 @@
     },
     "streamer_loader": {
       "udp_ip": "127.0.0.1",
-      "udp_port": 4242
+      "udp_port": 4242,
+      "sandbox_z_offset": 0.1,
+      "sandbox_z_range": 0.3
     },
     "projector_loader": {
       "base_udp_port": 5004,

@@ -15,7 +15,7 @@ class GodotLoader:
         self.projector_map_dirty = False
         self.last_sent_snapshot = None
         self.sandbox_config = None
-        self.last_sent_sandbox_config = None
+        self._godot_connected = False  # tracks last known reachability
 
     def discover_and_load(self, operator, config):
         cfg = config.get('godot_loader', {})
@@ -30,14 +30,13 @@ class GodotLoader:
             'output_res': repro_cfg.get('output_res', {'width': 256, 'height': 256}),
             'sandbox': repro_cfg.get('sandbox', {'width': 1.0, 'length': 1.0}),
             # Heightmap grayscale encoding: pixel = (z + z_offset) / z_range * 255
-            # z_offset and z_range are hardcoded in HeightmapStreamer C++ node
             'heightmap_z_offset': streamer_cfg.get('sandbox_z_offset', 0.25),
             'heightmap_z_range': streamer_cfg.get('sandbox_z_range', 0.50),
         }
 
-        # 1. Push sandbox config if not yet acknowledged by Godot
-        if self.last_sent_sandbox_config != json.dumps(self.sandbox_config, sort_keys=True):
-            self._push_sandbox_config(operator)
+        # 1. sandbox_config is sent every cycle as a heartbeat.
+        #    A successful send after a failed one means Godot just restarted → full resend.
+        self._push_sandbox_config(operator)
 
         # 2. Discover and subscribe to projector topics
         self.check_projector_topics(operator)
@@ -115,24 +114,27 @@ class GodotLoader:
                 s.connect((self.godot_ip, self.godot_port))
                 s.sendall(json.dumps(payload).encode('utf-8'))
             return True
-        except (ConnectionRefusedError, socket.timeout):
-            self._invalidate_sent_state()
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            if self._godot_connected:
+                self._godot_connected = False
+                self._invalidate_sent_state()
             return False
 
     def _push_sandbox_config(self, operator):
-        """Send sandbox configuration to Godot."""
-        payload = {
-            "command": "sandbox_config",
-            "data": self.sandbox_config,
-        }
+        """Send sandbox config every cycle — acts as a heartbeat.
+        On first success after a failure, triggers a full resend of all state."""
+        was_connected = self._godot_connected
+        payload = {"command": "sandbox_config", "data": self.sandbox_config}
         if self.send_to_godot(payload):
-            self.last_sent_sandbox_config = json.dumps(self.sandbox_config, sort_keys=True)
-            operator.get_logger().info(f"Pushed sandbox config to Godot: {self.sandbox_config}")
+            if not was_connected:
+                operator.get_logger().info("Godot (re)connected — sending full state.")
+                self.projector_map_dirty = bool(self.projector_map)
+                self.known_files.clear()
+            self._godot_connected = True
 
     def _invalidate_sent_state(self):
-        """Clear all sent-tracking so everything is resent once Godot is reachable."""
+        """Clear all pending-send state so everything is resent on next successful cycle."""
         self.last_sent_snapshot = None
-        self.last_sent_sandbox_config = None
         self.projector_map_dirty = bool(self.projector_map)
         self.known_files.clear()
 
