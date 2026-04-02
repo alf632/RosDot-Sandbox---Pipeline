@@ -18,6 +18,9 @@ public:
         this->declare_parameter("udp_port", 5005);
         this->declare_parameter("z_offset", 0.25);
         this->declare_parameter("z_range", 0.50);
+        // Which heightmap topic to stream.
+        // Use "/sandbox/heightmap" (visual, default) or "/sandbox/heightmap/physics" (smooth, for water sim).
+        this->declare_parameter("source_topic", std::string("/sandbox/heightmap"));
 
         sock_ = socket(AF_INET, SOCK_DGRAM, 0);
         int send_buff = 1024 * 1024;
@@ -29,7 +32,8 @@ public:
         servaddr_.sin_addr.s_addr = inet_addr(this->get_parameter("udp_ip").as_string().c_str());
 
         sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/sandbox/heightmap", rclcpp::SensorDataQoS(), std::bind(&HeightmapStreamer::image_callback, this, std::placeholders::_1));
+            this->get_parameter("source_topic").as_string(),
+            rclcpp::SensorDataQoS(), std::bind(&HeightmapStreamer::image_callback, this, std::placeholders::_1));
     }
     ~HeightmapStreamer() { if (sock_ >= 0) close(sock_); }
 
