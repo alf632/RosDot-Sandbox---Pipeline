@@ -7,17 +7,19 @@ class MergerLoader:
         merger_params = {
             'output_width':  cfg.get('output_res', {}).get('width', 256),
             'output_height': cfg.get('output_res', {}).get('height', 256),
-            # Bilateral spatial filter (replaces Gaussian; preserves sand relief edges)
-            'bilateral_d':            cfg.get('bilateral_d', 7),
-            'bilateral_sigma_color':  cfg.get('bilateral_sigma_color', 0.005),
-            'bilateral_sigma_space':  cfg.get('bilateral_sigma_space', 3.0),
-            # Slow layer: stable terrain + physics base
-            'slow_smoothing_factor':  cfg.get('slow_smoothing_factor', 2.0),
-            'slow_min_alpha':         cfg.get('slow_min_alpha', 0.01),
+            # Bilateral spatial filter (preserves sand relief edges)
+            'bilateral_d':           cfg.get('bilateral_d', 7),
+            'bilateral_sigma_color': cfg.get('bilateral_sigma_color', 0.005),
+            'bilateral_sigma_space': cfg.get('bilateral_sigma_space', 3.0),
+            # Terrain layer: non-linear exponential smoothing; tracks sand, suppresses noise
+            'terrain_smoothing_factor': cfg.get('terrain_smoothing_factor', 5.0),
+            'terrain_min_alpha':        cfg.get('terrain_min_alpha', 0.05),
+            # Physics layer: linear EMA of terrain layer; extra-smooth for water sim
+            'physics_alpha': cfg.get('physics_alpha', 0.02),
             # Fast layer: hands and placed objects
-            'fast_alpha':                cfg.get('fast_alpha', 0.40),
-            'fast_detection_threshold':  cfg.get('fast_detection_threshold', 0.015),
-            'fast_decay_alpha':          cfg.get('fast_decay_alpha', 0.10),
+            'fast_alpha':               cfg.get('fast_alpha', 0.40),
+            'fast_detection_threshold': cfg.get('fast_detection_threshold', 0.008),
+            'fast_decay_alpha':         cfg.get('fast_decay_alpha', 0.10),
         }
         operator.load_component(
             package='sandbox_components',

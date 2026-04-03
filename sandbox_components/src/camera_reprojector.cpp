@@ -33,6 +33,10 @@ public:
         this->declare_parameter("depth_min_mm", 300);   // Reject depth readings closer than this
         this->declare_parameter("depth_max_mm", 1500);  // Reject depth readings farther than this
         this->declare_parameter("median_blur_kernel", 3); // Odd integer; 1 disables, 3 or 5 recommended
+        // Minimum number of depth rays that must hit a grid cell (per camera) for it to count.
+        // 0.5 → accept any single hit (original behaviour, recommended for most setups).
+        // 1.5 → require ≥2 hits (rejects oblique/edge cells but can cause holes in blanket/box coverage).
+        this->declare_parameter("sparse_hit_threshold", 0.5);
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -102,6 +106,7 @@ private:
         uint16_t min_d = (uint16_t)this->get_parameter("depth_min_mm").as_int();
         uint16_t max_d = (uint16_t)this->get_parameter("depth_max_mm").as_int();
         int blur_k = this->get_parameter("median_blur_kernel").as_int();
+        float sparse_thresh = (float)this->get_parameter("sparse_hit_threshold").as_double();
 
         cv::Mat combined_data = cv::Mat::zeros(out_h, out_w, CV_32FC2);
         std::mutex merge_mutex;
@@ -165,14 +170,18 @@ private:
                     }
                 }
 
-                // Sparse-hit mask: discard cells hit by only a single ray (likely noise/edge artifact)
-                cv::Mat cam_planes[2];
-                cv::split(cam_data, cam_planes);
-                cv::Mat valid_mask;
-                cv::threshold(cam_planes[1], valid_mask, 1.5f, 1.0f, cv::THRESH_BINARY);
-                cam_planes[0] = cam_planes[0].mul(valid_mask);
-                cam_planes[1] = cam_planes[1].mul(valid_mask);
-                cv::merge(cam_planes, 2, cam_data);
+                // Sparse-hit mask: discard cells below the minimum hit count.
+                // Default threshold=0.5 keeps all cells with ≥1 hit (same as no mask).
+                // Raise to 1.5 to require ≥2 hits if single-hit noise is a problem.
+                if (sparse_thresh > 0.0f) {
+                    cv::Mat cam_planes[2];
+                    cv::split(cam_data, cam_planes);
+                    cv::Mat valid_mask;
+                    cv::threshold(cam_planes[1], valid_mask, sparse_thresh, 1.0f, cv::THRESH_BINARY);
+                    cam_planes[0] = cam_planes[0].mul(valid_mask);
+                    cam_planes[1] = cam_planes[1].mul(valid_mask);
+                    cv::merge(cam_planes, 2, cam_data);
+                }
 
                 std::lock_guard<std::mutex> lock(merge_mutex);
                 combined_data += cam_data;

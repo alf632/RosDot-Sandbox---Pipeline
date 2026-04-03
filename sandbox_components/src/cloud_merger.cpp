@@ -8,6 +8,18 @@
 
 namespace sandbox_components {
 
+// Three-layer temporal pipeline:
+//
+//  terrain_layer_  — non-linear exponential smoothing; tracks sand relief (seconds),
+//                    strongly suppresses frame-to-frame noise; feeds visual output.
+//
+//  physics_layer_  — linear EMA of terrain_layer_; much slower, ultra-smooth;
+//                    immune to sand reshaping transients; feeds /sandbox/heightmap/physics.
+//
+//  fast_layer_     — tracks large sudden deltas (hands, placed objects) with high alpha,
+//                    decays back toward terrain_layer_ when stimulus is gone;
+//                    blended over terrain_layer_ in the visual composite.
+
 class CloudMerger : public rclcpp::Node {
 public:
     explicit CloudMerger(const rclcpp::NodeOptions & options)
@@ -17,27 +29,37 @@ public:
 
         // Bilateral spatial filter (replaces Gaussian blur; preserves sand relief edges)
         this->declare_parameter("bilateral_d", 7);                // Neighborhood diameter in pixels
-        this->declare_parameter("bilateral_sigma_color", 0.005);  // Height delta (m) treated as edge; lower = sharper relief
+        this->declare_parameter("bilateral_sigma_color", 0.005);  // Height delta (m) treated as an edge; lower = sharper relief
         this->declare_parameter("bilateral_sigma_space", 3.0);    // Spatial falloff in pixels
 
-        // Slow layer: stable terrain + physics base (non-linear exponential smoothing)
-        this->declare_parameter("slow_smoothing_factor", 2.0);    // Multiplier for delta before squaring
-        this->declare_parameter("slow_min_alpha", 0.01);          // Floor alpha; keeps the layer from freezing
+        // Terrain layer: tracks sand relief, suppresses noise.
+        // The squaring trick means: alpha ≈ (|delta| * factor)^2, floored at min_alpha.
+        // A 3mm noise spike at factor=5 gets alpha=(0.003*5)^2=0.0002 → min_alpha wins → 0.05
+        // A 30mm sand hill  at factor=5 gets alpha=(0.030*5)^2=0.022  → min_alpha wins → 0.05
+        // A 200mm hand      at factor=5 gets alpha=(0.200*5)^2=1.0    → clamped to 1.0
+        // Net effect: noise and sand both converge at min_alpha rate; hands jump instantly.
+        this->declare_parameter("terrain_smoothing_factor", 5.0);  // Match original pipeline
+        this->declare_parameter("terrain_min_alpha", 0.05);        // Floor blend rate per frame
 
-        // Fast layer: hands and placed objects (decays back toward slow layer when stimulus leaves)
-        this->declare_parameter("fast_alpha", 0.40);              // Chase alpha when object detected (~5 frames to respond)
-        this->declare_parameter("fast_detection_threshold", 0.015); // Min height delta (m) to classify as a real object
-        this->declare_parameter("fast_decay_alpha", 0.10);        // Decay rate back toward slow layer when no object (~10 frames)
+        // Physics layer: linear EMA of terrain_layer_. Decouples water-sim smoothness from
+        // terrain tracking speed. Lower = smoother but more lag behind sand reshaping.
+        this->declare_parameter("physics_alpha", 0.02);            // ~50 frames (1.7 s) to 63% of a step change
+
+        // Fast layer: hands and placed objects.
+        this->declare_parameter("fast_alpha", 0.40);               // Chase alpha when object detected (~5 frames)
+        this->declare_parameter("fast_detection_threshold", 0.008);// Min delta (m) to count as an object (8 mm)
+        this->declare_parameter("fast_decay_alpha", 0.10);         // Decay toward terrain layer when object gone (~10 frames)
 
         int w = this->get_parameter("output_width").as_int();
         int h = this->get_parameter("output_height").as_int();
-        slow_layer_ = cv::Mat::zeros(h, w, CV_32FC1);
-        fast_layer_ = cv::Mat::zeros(h, w, CV_32FC1);
+        terrain_layer_ = cv::Mat::zeros(h, w, CV_32FC1);
+        physics_layer_ = cv::Mat::zeros(h, w, CV_32FC1);
+        fast_layer_    = cv::Mat::zeros(h, w, CV_32FC1);
 
-        // /sandbox/heightmap         — visual composite (terrain + transient objects); backward-compatible
-        // /sandbox/heightmap/physics — slow layer only (ultra-smooth; for water/physics simulation)
-        pub_visual_   = this->create_publisher<sensor_msgs::msg::Image>("/sandbox/heightmap",         rclcpp::SensorDataQoS());
-        pub_physics_  = this->create_publisher<sensor_msgs::msg::Image>("/sandbox/heightmap/physics", rclcpp::SensorDataQoS());
+        // /sandbox/heightmap         — visual composite (terrain + objects/hands); backward-compatible
+        // /sandbox/heightmap/physics — ultra-smooth physics base; no transient objects
+        pub_visual_  = this->create_publisher<sensor_msgs::msg::Image>("/sandbox/heightmap",         rclcpp::SensorDataQoS());
+        pub_physics_ = this->create_publisher<sensor_msgs::msg::Image>("/sandbox/heightmap/physics", rclcpp::SensorDataQoS());
 
         discovery_timer_ = this->create_wall_timer(std::chrono::seconds(2), std::bind(&CloudMerger::discover_topics, this));
 
@@ -88,42 +110,48 @@ private:
         cv::Mat mean_h;
         cv::divide(final_accum, final_count, mean_h);
 
-        // Fill void regions (zero count) with simple dilation-based fill rather than inpaint
+        // Fill void regions (zero count) with dilation-based fill (avoids inpaint artifacts)
         cv::Mat void_mask;
         cv::compare(final_count, 0, void_mask, cv::CMP_EQ);
         mean_h.setTo(0.0f, void_mask);
-
         cv::Mat dilated;
         cv::dilate(mean_h, dilated, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
         void_mask.convertTo(void_mask, CV_8U);
         dilated.copyTo(mean_h, void_mask);
 
         // Bilateral filter: smooths flat areas while preserving sand relief edges
-        int bd              = this->get_parameter("bilateral_d").as_int();
-        double bs_color     = this->get_parameter("bilateral_sigma_color").as_double();
-        double bs_space     = this->get_parameter("bilateral_sigma_space").as_double();
+        int bd          = this->get_parameter("bilateral_d").as_int();
+        double bs_color = this->get_parameter("bilateral_sigma_color").as_double();
+        double bs_space = this->get_parameter("bilateral_sigma_space").as_double();
         cv::Mat mean_h_filtered;
         cv::bilateralFilter(mean_h, mean_h_filtered, bd, bs_color, bs_space);
         mean_h = mean_h_filtered;
 
-        // --- SLOW LAYER: stable terrain + physics base ---
-        // Non-linear adaptive exponential smoothing.
-        // Small deltas (noise) get severely suppressed; large deltas (real terrain change) pass through.
-        float slow_sf    = (float)this->get_parameter("slow_smoothing_factor").as_double();
-        float slow_min_a = (float)this->get_parameter("slow_min_alpha").as_double();
+        // --- TERRAIN LAYER ---
+        // Non-linear adaptive smoothing: alpha = clamp((|delta|*factor)^2, min_alpha, 1.0)
+        // Noise and small features converge slowly at min_alpha; large step changes pass instantly.
+        float t_sf     = (float)this->get_parameter("terrain_smoothing_factor").as_double();
+        float t_min_a  = (float)this->get_parameter("terrain_min_alpha").as_double();
 
-        cv::Mat slow_delta     = mean_h - slow_layer_;
-        cv::Mat abs_slow_delta = cv::abs(slow_delta);
-        cv::Mat slow_alpha     = abs_slow_delta * slow_sf;
-        cv::pow(slow_alpha, 2.0, slow_alpha);
-        cv::threshold(slow_alpha, slow_alpha, 1.0, 1.0, cv::THRESH_TRUNC);
-        cv::max(slow_alpha, slow_min_a, slow_alpha);
+        cv::Mat t_delta     = mean_h - terrain_layer_;
+        cv::Mat abs_t_delta = cv::abs(t_delta);
+        cv::Mat t_alpha     = abs_t_delta * t_sf;
+        cv::pow(t_alpha, 2.0, t_alpha);
+        cv::threshold(t_alpha, t_alpha, 1.0, 1.0, cv::THRESH_TRUNC);
+        cv::max(t_alpha, t_min_a, t_alpha);
 
-        slow_layer_ += slow_delta.mul(slow_alpha);
-        cv::patchNaNs(slow_layer_, 0.0f);
+        terrain_layer_ += t_delta.mul(t_alpha);
+        cv::patchNaNs(terrain_layer_, 0.0f);
+
+        // --- PHYSICS LAYER ---
+        // Simple linear EMA of terrain_layer_. Extra smoothing decouples water-sim quality
+        // from terrain tracking speed. Adjust physics_alpha to taste.
+        float p_alpha = (float)this->get_parameter("physics_alpha").as_double();
+        physics_layer_ += (terrain_layer_ - physics_layer_) * p_alpha;
+        cv::patchNaNs(physics_layer_, 0.0f);
 
         // --- FAST LAYER: objects and hands ---
-        // Chases large deltas quickly; decays back toward slow_layer_ when stimulus disappears.
+        // Chases large deltas quickly; decays back toward terrain_layer_ when gone.
         float fast_a      = (float)this->get_parameter("fast_alpha").as_double();
         float fast_thresh = (float)this->get_parameter("fast_detection_threshold").as_double();
         float fast_decay  = (float)this->get_parameter("fast_decay_alpha").as_double();
@@ -131,34 +159,31 @@ private:
         cv::Mat fast_delta     = mean_h - fast_layer_;
         cv::Mat abs_fast_delta = cv::abs(fast_delta);
 
-        // Binary mask: 1.0 where a real object is present, 0.0 where not
         cv::Mat object_mask;
         cv::threshold(abs_fast_delta, object_mask, fast_thresh, 1.0f, cv::THRESH_BINARY);
 
-        // Where object detected: chase the measurement
-        // Where no object: relax back toward the slow (terrain) layer
         cv::Mat fast_update =
             fast_delta.mul(object_mask) * fast_a +
-            (slow_layer_ - fast_layer_).mul(1.0f - object_mask) * fast_decay;
+            (terrain_layer_ - fast_layer_).mul(1.0f - object_mask) * fast_decay;
         fast_layer_ += fast_update;
         cv::patchNaNs(fast_layer_, 0.0f);
 
-        // --- COMPOSITE OUTPUT (visual) ---
-        // Base is the slow layer; fast layer is blended in where it differs significantly.
-        // The blend mask is smoothed to avoid hard spatial edges.
-        cv::Mat layer_diff = cv::abs(fast_layer_ - slow_layer_);
+        // --- COMPOSITE VISUAL OUTPUT ---
+        // Base is terrain_layer_; fast_layer_ is blended in where it differs significantly.
+        // Blend mask is Gaussian-smoothed to avoid hard spatial edges around objects.
+        cv::Mat layer_diff = cv::abs(fast_layer_ - terrain_layer_);
         cv::Mat blend_weight;
         cv::threshold(layer_diff, blend_weight, 0.005f, 1.0f, cv::THRESH_BINARY);
         cv::GaussianBlur(blend_weight, blend_weight, cv::Size(9, 9), 2.0);
-        cv::Mat visual_output = slow_layer_ + (fast_layer_ - slow_layer_).mul(blend_weight);
+        cv::Mat visual_output = terrain_layer_ + (fast_layer_ - terrain_layer_).mul(blend_weight);
         cv::patchNaNs(visual_output, 0.0f);
 
-        // Publish physics topic (slow layer only — maximally smooth for water sim)
+        // Publish physics (extra-smooth, no transient objects)
         auto physics_msg = std::make_unique<sensor_msgs::msg::Image>();
-        cv_bridge::CvImage(std_msgs::msg::Header(), "32FC1", slow_layer_).toImageMsg(*physics_msg);
+        cv_bridge::CvImage(std_msgs::msg::Header(), "32FC1", physics_layer_).toImageMsg(*physics_msg);
         pub_physics_->publish(std::move(physics_msg));
 
-        // Publish visual topic (composite — terrain + transient objects/hands)
+        // Publish visual composite (terrain + hands/objects)
         auto visual_msg = std::make_unique<sensor_msgs::msg::Image>();
         cv_bridge::CvImage(std_msgs::msg::Header(), "32FC1", visual_output).toImageMsg(*visual_msg);
         pub_visual_->publish(std::move(visual_msg));
@@ -167,8 +192,9 @@ private:
     std::mutex mtx_;
     std::map<std::string, sensor_msgs::msg::Image::SharedPtr> latest_maps_;
     std::map<std::string, rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> subs_;
-    cv::Mat slow_layer_;   // Stable terrain; drives physics/water sim
-    cv::Mat fast_layer_;   // Transient objects and hands; decays without stimulus
+    cv::Mat terrain_layer_;  // Tracks sand relief; noise-suppressed via non-linear smoothing
+    cv::Mat physics_layer_;  // Ultra-smooth EMA of terrain_layer_; for water/physics sim
+    cv::Mat fast_layer_;     // Transient objects/hands blended over terrain in visual output
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_visual_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_physics_;
     rclcpp::TimerBase::SharedPtr timer_, discovery_timer_;

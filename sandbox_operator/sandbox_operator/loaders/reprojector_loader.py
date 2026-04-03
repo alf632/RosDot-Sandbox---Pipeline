@@ -17,6 +17,8 @@ class ReprojectorLoader:
             # Spatial median blur on raw depth before reprojection (removes hot pixels).
             # Must be an odd integer; set to 1 to disable.
             'median_blur_kernel': cfg.get('median_blur_kernel', 3),
+            # Minimum hit count per grid cell per camera (0.5 = accept any single hit; 1.5 = require ≥2).
+            'sparse_hit_threshold': cfg.get('sparse_hit_threshold', 0.5),
         }
 
         operator.load_component(

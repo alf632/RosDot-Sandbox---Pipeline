@@ -23,17 +23,19 @@
       "sandbox": {"width": 1.8, "length": 1.3},
       "depth_min_mm": 300,
       "depth_max_mm": 1500,
-      "median_blur_kernel": 3
+      "median_blur_kernel": 3,
+      "sparse_hit_threshold": 0.5
     },
     "merger_loader": {
       "output_res": {"width": 256, "height": 256},
       "bilateral_d": 7,
-      "bilateral_sigma_color": 0.005,
+      "bilateral_sigma_color": 0.020,
       "bilateral_sigma_space": 3.0,
-      "slow_smoothing_factor": 2.0,
-      "slow_min_alpha": 0.01,
+      "terrain_smoothing_factor": 2.0,
+      "terrain_min_alpha": 0.2,
+      "physics_alpha": 0.1,
       "fast_alpha": 0.40,
-      "fast_detection_threshold": 0.015,
+      "fast_detection_threshold": 0.008,
       "fast_decay_alpha": 0.10
     },
     "streamer_loader": {

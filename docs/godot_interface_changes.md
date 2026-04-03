@@ -81,11 +81,12 @@ shape against expected object footprints).
 
 All parameters below live in `config.json` and take effect on the next pipeline start.
 
-| Parameter                            | Default | Effect |
-|--------------------------------------|---------|--------|
-| `streamer_loader.physics_udp_port`   | 4243    | UDP port for the physics/water stream; remove key to disable |
-| `merger_loader.slow_smoothing_factor`| 2.0     | Higher = slower terrain response (more noise immune) |
-| `merger_loader.slow_min_alpha`       | 0.01    | Floor blend rate for slow layer; keep very small |
-| `merger_loader.fast_alpha`           | 0.40    | How fast objects appear (higher = faster, ~1/fast_alpha frames) |
-| `merger_loader.fast_detection_threshold` | 0.015 | Minimum height delta (m) to register as an object; raise to ignore small hands |
-| `merger_loader.fast_decay_alpha`     | 0.10    | How fast objects fade after removal (~1/fast_decay_alpha frames) |
+| Parameter                                | Default | Effect |
+|------------------------------------------|---------|--------|
+| `streamer_loader.physics_udp_port`       | 4243    | UDP port for the physics/water stream; remove key to disable |
+| `merger_loader.terrain_smoothing_factor` | 5.0     | Higher = stronger noise suppression but slower terrain tracking |
+| `merger_loader.terrain_min_alpha`        | 0.05    | Floor blend rate for terrain layer; higher = faster terrain tracking |
+| `merger_loader.physics_alpha`            | 0.02    | Physics layer EMA rate; lower = smoother but more lag (~1/alpha frames to 63%) |
+| `merger_loader.fast_alpha`               | 0.40    | How fast objects appear (~1/fast_alpha frames) |
+| `merger_loader.fast_detection_threshold` | 0.008   | Minimum height delta (m) to register as an object (8 mm); raise to ignore small features |
+| `merger_loader.fast_decay_alpha`         | 0.10    | How fast objects fade after removal (~1/fast_decay_alpha frames) |
