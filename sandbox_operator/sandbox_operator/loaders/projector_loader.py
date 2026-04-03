@@ -134,6 +134,7 @@ class ProjectorLoader:
             "--no-terminal",
             "--no-input-default-bindings",
             "--profile=low-latency",
+            "--untimed",
             f"udp://0.0.0.0:{port}",
         ]
 
