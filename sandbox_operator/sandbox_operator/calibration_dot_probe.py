@@ -40,32 +40,52 @@ def make_black_image(proj_w: int, proj_h: int) -> np.ndarray:
 
 def detect_blob_centroids(frame_gray: np.ndarray,
                           baseline_gray: np.ndarray | None = None,
-                          min_area: int = 20,
-                          max_area: int = 5000) -> list[tuple[float, float]]:
+                          min_area: int = 50,
+                          max_area: int = 60000,
+                          threshold: int | None = None,
+                          ) -> list[tuple[float, float, float]]:
     """
     Detect bright blob centroids in `frame_gray`.
 
     If `baseline_gray` is provided the two frames are subtracted first
     to isolate the projected dot from ambient scene content.
 
-    Returns a list of (u, v) float centroid positions.
+    `threshold` — absolute grey-level diff that counts as "changed".
+    If None (default), uses an adaptive value: min(30, max_diff * 0.35),
+    so faint dots on cameras far from the sandbox are still caught.
+
+    Area limits are wide by default to accommodate oblique camera views where
+    a circular dot appears as a large foreshortened ellipse.
+
+    Returns a list of (u, v, area) tuples, sorted largest→smallest by area
+    (best candidate first).  Callers that want only the top hit use [0].
     """
     if baseline_gray is not None:
         diff = cv2.absdiff(frame_gray, baseline_gray)
     else:
         diff = frame_gray.copy()
 
-    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    max_diff = int(diff.max())
+    if max_diff == 0:
+        return []
+
+    if threshold is None:
+        threshold = max(4, min(30, int(max_diff * 0.35)))
+
+    _, thresh = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    centroids = []
+    candidates = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if min_area <= area <= max_area:
             M = cv2.moments(cnt)
             if M['m00'] > 0:
-                centroids.append((M['m10'] / M['m00'], M['m01'] / M['m00']))
-    return centroids
+                candidates.append((M['m10'] / M['m00'], M['m01'] / M['m00'], float(area)))
+
+    # Sort largest blob first — the real dot dominates over noise patches
+    candidates.sort(key=lambda c: c[2], reverse=True)
+    return candidates
