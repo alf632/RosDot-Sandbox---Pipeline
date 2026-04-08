@@ -1,5 +1,10 @@
 #include <map>
 #include <mutex>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <filesystem>
+#include <algorithm>
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 #include "sensor_msgs/msg/image.hpp"
@@ -37,6 +42,11 @@ public:
         // 0.5 → accept any single hit (original behaviour, recommended for most setups).
         // 1.5 → require ≥2 hits (rejects oblique/edge cells but can cause holes in blanket/box coverage).
         this->declare_parameter("sparse_hit_threshold", 0.5);
+        // Directory containing per-camera TF JSON files with optional _quality_weight field.
+        this->declare_parameter("calibration_dir", "/tmp/calibrations/tf_configs");
+        // Max per-cell height deviation from median before a camera is rejected (metres).
+        // Only active when >2 cameras contribute to a cell.  0 = disabled.
+        this->declare_parameter("outlier_rejection_threshold", 0.020);
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -51,9 +61,73 @@ public:
         );
 
         discovery_timer_ = this->create_wall_timer(std::chrono::seconds(2), std::bind(&CameraReprojector::discover_cameras, this));
+
+        // Load weights now, then reload every 30 s
+        reload_camera_weights();
+        weight_timer_ = this->create_wall_timer(std::chrono::seconds(30),
+            std::bind(&CameraReprojector::reload_camera_weights, this));
     }
 
 private:
+    // ── camera serial extraction ────────────────────────────────────────────
+    // Works for strings like "cam_101622075200_link" or
+    // "cam_101622075200_depth_optical_frame" — returns "101622075200".
+    static std::string extract_serial(const std::string& s) {
+        auto pos = s.find("cam_");
+        if (pos == std::string::npos) return "";
+        pos += 4;
+        auto end = s.find('_', pos);
+        if (end == std::string::npos) end = s.size();
+        return s.substr(pos, end - pos);
+    }
+
+    // ── weight loading from calibration JSON files ──────────────────────────
+    void reload_camera_weights() {
+        std::string cal_dir = this->get_parameter("calibration_dir").as_string();
+        std::map<std::string, float> new_weights;
+        try {
+            for (auto const& entry : std::filesystem::directory_iterator(cal_dir)) {
+                if (entry.path().extension() != ".json") continue;
+                std::string serial = extract_serial(entry.path().stem().string());
+                if (serial.empty()) continue;
+                float w = parse_quality_weight(entry.path().string());
+                new_weights[serial] = w;
+            }
+        } catch (const std::filesystem::filesystem_error&) {
+            // Directory doesn't exist yet — not an error during early boot.
+        }
+        if (!new_weights.empty()) {
+            std::lock_guard<std::mutex> lock(weight_mutex_);
+            camera_weights_ = std::move(new_weights);
+        }
+    }
+
+    // Minimal JSON value extraction — finds "_quality_weight": <number> in file.
+    static float parse_quality_weight(const std::string& path) {
+        std::ifstream f(path);
+        if (!f.is_open()) return 1.0f;
+        std::string line;
+        while (std::getline(f, line)) {
+            auto pos = line.find("\"_quality_weight\"");
+            if (pos == std::string::npos) continue;
+            pos = line.find(':', pos);
+            if (pos == std::string::npos) continue;
+            try {
+                return std::stof(line.substr(pos + 1));
+            } catch (...) {}
+        }
+        return 1.0f;  // default: full weight
+    }
+
+    float get_camera_weight(const std::string& frame_id) {
+        std::string serial = extract_serial(frame_id);
+        if (serial.empty()) return 1.0f;
+        std::lock_guard<std::mutex> lock(weight_mutex_);
+        auto it = camera_weights_.find(serial);
+        return (it != camera_weights_.end()) ? it->second : 1.0f;
+    }
+
+    // ── camera discovery ────────────────────────────────────────────────────
     void discover_cameras() {
         std::string target_ns = this->get_parameter("target_namespace").as_string();
         auto topics = this->get_topic_names_and_types();
@@ -96,6 +170,7 @@ private:
         RCLCPP_INFO(this->get_logger(), "Pipeline initialized for: %s", topic.c_str());
     }
 
+    // ── main processing loop ────────────────────────────────────────────────
     void combine_and_publish() {
         if (pub_->get_subscription_count() == 0 || latest_frames_.empty()) return;
 
@@ -107,9 +182,7 @@ private:
         uint16_t max_d = (uint16_t)this->get_parameter("depth_max_mm").as_int();
         int blur_k = this->get_parameter("median_blur_kernel").as_int();
         float sparse_thresh = (float)this->get_parameter("sparse_hit_threshold").as_double();
-
-        cv::Mat combined_data = cv::Mat::zeros(out_h, out_w, CV_32FC2);
-        std::mutex merge_mutex;
+        float outlier_thresh = (float)this->get_parameter("outlier_rejection_threshold").as_double();
 
         std::vector<std::string> active_topics;
         {
@@ -117,7 +190,17 @@ private:
             for (auto const& [t, msg] : latest_frames_) active_topics.push_back(t);
         }
 
-        cv::parallel_for_(cv::Range(0, active_topics.size()), [&](const cv::Range& r) {
+        int num_cams = (int)active_topics.size();
+
+        // Per-camera results: heightmap (CV_32FC2) + weight
+        struct CamResult {
+            cv::Mat data;       // empty if camera skipped
+            float weight = 1.0f;
+        };
+        std::vector<CamResult> cam_results(num_cams);
+
+        // Process each camera in parallel
+        cv::parallel_for_(cv::Range(0, num_cams), [&](const cv::Range& r) {
             for (int i = r.start; i < r.end; i++) {
                 std::string topic = active_topics[i];
                 auto pipe = pipelines_[topic];
@@ -130,8 +213,10 @@ private:
                 }
 
                 Eigen::Isometry3f tf;
+                std::string frame_id;
                 try {
-                    auto ts = tf_buffer_->lookupTransform("sandbox_origin", msg->header.frame_id, tf2::TimePointZero);
+                    frame_id = msg->header.frame_id;
+                    auto ts = tf_buffer_->lookupTransform("sandbox_origin", frame_id, tf2::TimePointZero);
                     tf = tf2::transformToEigen(ts).cast<float>();
                 } catch (const tf2::TransformException & ex) {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
@@ -183,10 +268,91 @@ private:
                     cv::merge(cam_planes, 2, cam_data);
                 }
 
-                std::lock_guard<std::mutex> lock(merge_mutex);
-                combined_data += cam_data;
+                cam_results[i].data = cam_data;
+                cam_results[i].weight = get_camera_weight(frame_id);
             }
         });
+
+        // ── combine per-camera heightmaps ───────────────────────────────────
+        cv::Mat combined_data = cv::Mat::zeros(out_h, out_w, CV_32FC2);
+
+        // Count cameras that actually produced data
+        int active_cams = 0;
+        for (auto const& cr : cam_results) {
+            if (!cr.data.empty()) active_cams++;
+        }
+
+        if (active_cams <= 2 || outlier_thresh <= 0.0f) {
+            // ≤2 cameras or outlier rejection disabled: weighted sum
+            for (auto const& cr : cam_results) {
+                if (cr.data.empty()) continue;
+                if (std::abs(cr.weight - 1.0f) < 1e-6f) {
+                    combined_data += cr.data;
+                } else {
+                    combined_data += cr.data * cr.weight;
+                }
+            }
+        } else {
+            // >2 cameras: per-cell median-based outlier rejection
+            // Split each camera's data into height-sum and count planes
+            std::vector<int> valid_indices;
+            std::vector<cv::Mat> cam_heights, cam_counts;
+            std::vector<float> cam_weights;
+            for (int i = 0; i < num_cams; i++) {
+                if (cam_results[i].data.empty()) continue;
+                valid_indices.push_back(i);
+                cv::Mat planes[2];
+                cv::split(cam_results[i].data, planes);
+                cam_heights.push_back(planes[0]);
+                cam_counts.push_back(planes[1]);
+                cam_weights.push_back(cam_results[i].weight);
+            }
+
+            int n_valid = (int)valid_indices.size();
+            cv::Mat out_accum = cv::Mat::zeros(out_h, out_w, CV_32FC1);
+            cv::Mat out_count = cv::Mat::zeros(out_h, out_w, CV_32FC1);
+
+            for (int y = 0; y < out_h; y++) {
+                for (int x = 0; x < out_w; x++) {
+                    // Collect per-camera mean heights for this cell
+                    struct CellEntry { float mean_h; int idx; };
+                    std::vector<CellEntry> entries;
+                    entries.reserve(n_valid);
+                    for (int c = 0; c < n_valid; c++) {
+                        float cnt = cam_counts[c].at<float>(y, x);
+                        if (cnt > 0.5f) {
+                            entries.push_back({cam_heights[c].at<float>(y, x) / cnt, c});
+                        }
+                    }
+
+                    if (entries.size() < 3) {
+                        // Not enough cameras for outlier detection — weighted sum
+                        for (auto const& e : entries) {
+                            float w = cam_weights[e.idx];
+                            out_accum.at<float>(y, x) += cam_heights[e.idx].at<float>(y, x) * w;
+                            out_count.at<float>(y, x) += cam_counts[e.idx].at<float>(y, x) * w;
+                        }
+                    } else {
+                        // Compute median height
+                        std::sort(entries.begin(), entries.end(),
+                                  [](auto const& a, auto const& b){ return a.mean_h < b.mean_h; });
+                        float median = entries[entries.size() / 2].mean_h;
+
+                        // Accumulate cameras within threshold of median
+                        for (auto const& e : entries) {
+                            if (std::abs(e.mean_h - median) <= outlier_thresh) {
+                                float w = cam_weights[e.idx];
+                                out_accum.at<float>(y, x) += cam_heights[e.idx].at<float>(y, x) * w;
+                                out_count.at<float>(y, x) += cam_counts[e.idx].at<float>(y, x) * w;
+                            }
+                        }
+                    }
+                }
+            }
+
+            cv::Mat merged[2] = {out_accum, out_count};
+            cv::merge(merged, 2, combined_data);
+        }
 
         auto unique_msg = std::make_unique<sensor_msgs::msg::Image>();
         cv_bridge::CvImage(std_msgs::msg::Header(), "32FC2", combined_data).toImageMsg(*unique_msg);
@@ -194,12 +360,14 @@ private:
     }
 
     std::mutex data_mutex_;
+    std::mutex weight_mutex_;
     std::map<std::string, std::shared_ptr<CameraPipeline>> pipelines_;
     std::map<std::string, sensor_msgs::msg::Image::SharedPtr> latest_frames_;
+    std::map<std::string, float> camera_weights_;   // serial → quality weight
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_;
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-    rclcpp::TimerBase::SharedPtr discovery_timer_, process_timer_;
+    rclcpp::TimerBase::SharedPtr discovery_timer_, process_timer_, weight_timer_;
     rclcpp::CallbackGroup::SharedPtr timer_cb_group_;
 };
 } // namespace sandbox_components

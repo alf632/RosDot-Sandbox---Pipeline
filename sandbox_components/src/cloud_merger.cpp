@@ -1,5 +1,7 @@
 #include <mutex>
 #include <map>
+#include <vector>
+#include <algorithm>
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 #include "sensor_msgs/msg/image.hpp"
@@ -50,6 +52,12 @@ public:
         this->declare_parameter("fast_detection_threshold", 0.008);// Min delta (m) to count as an object (8 mm)
         this->declare_parameter("fast_decay_alpha", 0.10);         // Decay toward terrain layer when object gone (~10 frames)
 
+        // Per-cell outlier rejection for multi-device setups (>2 heightmap sources).
+        // When ≥ outlier_min_sources contribute to a cell, the median height is computed
+        // and cameras deviating by more than outlier_rejection_threshold are discarded.
+        this->declare_parameter("outlier_rejection_threshold", 0.020);  // metres
+        this->declare_parameter("outlier_min_sources", 3);              // minimum sources to enable rejection
+
         int w = this->get_parameter("output_width").as_int();
         int h = this->get_parameter("output_height").as_int();
         terrain_layer_ = cv::Mat::zeros(h, w, CV_32FC1);
@@ -93,10 +101,24 @@ private:
 
         int w = this->get_parameter("output_width").as_int();
         int h = this->get_parameter("output_height").as_int();
+        float outlier_thresh = (float)this->get_parameter("outlier_rejection_threshold").as_double();
+        int   outlier_min    = this->get_parameter("outlier_min_sources").as_int();
+
         cv::Mat final_accum = cv::Mat::zeros(h, w, CV_32FC1);
         cv::Mat final_count = cv::Mat::zeros(h, w, CV_32FC1);
 
+        // Count sources and decide strategy
+        int n_sources;
         {
+            std::lock_guard<std::mutex> lock(mtx_);
+            n_sources = (int)latest_maps_.size();
+        }
+
+        bool use_outlier_rejection =
+            (outlier_thresh > 0.0f && n_sources >= outlier_min);
+
+        if (!use_outlier_rejection) {
+            // Simple accumulation (original path — ≤2 sources or rejection disabled)
             std::lock_guard<std::mutex> lock(mtx_);
             for (auto const& [topic, msg] : latest_maps_) {
                 cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "32FC2");
@@ -104,6 +126,50 @@ private:
                 cv::split(cv_ptr->image, planes);
                 final_accum += planes[0];
                 final_count += planes[1];
+            }
+        } else {
+            // Per-cell median-based outlier rejection
+            std::vector<cv::Mat> src_heights, src_counts;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                for (auto const& [topic, msg] : latest_maps_) {
+                    cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "32FC2");
+                    cv::Mat planes[2];
+                    cv::split(cv_ptr->image, planes);
+                    src_heights.push_back(planes[0].clone());
+                    src_counts.push_back(planes[1].clone());
+                }
+            }
+
+            int n_src = (int)src_heights.size();
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    struct Entry { float mean_h; int idx; };
+                    std::vector<Entry> entries;
+                    entries.reserve(n_src);
+                    for (int s = 0; s < n_src; s++) {
+                        float cnt = src_counts[s].at<float>(y, x);
+                        if (cnt > 0.5f) {
+                            entries.push_back({src_heights[s].at<float>(y, x) / cnt, s});
+                        }
+                    }
+                    if ((int)entries.size() < outlier_min) {
+                        for (auto const& e : entries) {
+                            final_accum.at<float>(y, x) += src_heights[e.idx].at<float>(y, x);
+                            final_count.at<float>(y, x) += src_counts[e.idx].at<float>(y, x);
+                        }
+                    } else {
+                        std::sort(entries.begin(), entries.end(),
+                                  [](auto const& a, auto const& b){ return a.mean_h < b.mean_h; });
+                        float median = entries[entries.size() / 2].mean_h;
+                        for (auto const& e : entries) {
+                            if (std::abs(e.mean_h - median) <= outlier_thresh) {
+                                final_accum.at<float>(y, x) += src_heights[e.idx].at<float>(y, x);
+                                final_count.at<float>(y, x) += src_counts[e.idx].at<float>(y, x);
+                            }
+                        }
+                    }
+                }
             }
         }
 

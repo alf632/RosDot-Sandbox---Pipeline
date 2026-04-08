@@ -19,6 +19,10 @@ class ReprojectorLoader:
             'median_blur_kernel': cfg.get('median_blur_kernel', 3),
             # Minimum hit count per grid cell per camera (0.5 = accept any single hit; 1.5 = require ≥2).
             'sparse_hit_threshold': cfg.get('sparse_hit_threshold', 0.5),
+            # Directory with per-camera TF JSON files containing _quality_weight.
+            'calibration_dir': cfg.get('calibration_dir', '/tmp/calibrations/tf_configs'),
+            # Per-cell outlier rejection threshold (metres).  Active when >2 cameras.
+            'outlier_rejection_threshold': cfg.get('outlier_rejection_threshold', 0.020),
         }
 
         operator.load_component(

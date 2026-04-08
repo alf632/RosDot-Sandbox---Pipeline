@@ -32,7 +32,7 @@
       "bilateral_sigma_color": 0.050,
       "bilateral_sigma_space": 3.0,
       "terrain_smoothing_factor": 6.0,
-      "terrain_min_alpha": 0.0002,
+      "terrain_min_alpha": 0.002,
       "physics_alpha": 0.3,
       "fast_alpha": 0.40,
       "fast_detection_threshold": 0.008,

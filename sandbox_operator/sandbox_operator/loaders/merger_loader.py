@@ -20,6 +20,9 @@ class MergerLoader:
             'fast_alpha':               cfg.get('fast_alpha', 0.40),
             'fast_detection_threshold': cfg.get('fast_detection_threshold', 0.008),
             'fast_decay_alpha':         cfg.get('fast_decay_alpha', 0.10),
+            # Per-cell outlier rejection (active when ≥ outlier_min_sources heightmap sources)
+            'outlier_rejection_threshold': cfg.get('outlier_rejection_threshold', 0.020),
+            'outlier_min_sources':         cfg.get('outlier_min_sources', 3),
         }
         operator.load_component(
             package='sandbox_components',

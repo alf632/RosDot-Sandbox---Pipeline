@@ -67,6 +67,7 @@ class CalibrationCore(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.bridge = CvBridge()
+        self.debug_lines = []
 
         # Projector Calibration State
         self.is_calibrating_proj = False
@@ -92,10 +93,15 @@ class CalibrationCore(Node):
         self._corner_rays: dict = {}       # corner_id → {cam_name: (origin, direction)}
         self._stereo_corners: set = set()  # corners that have a confirmed stereo world point
         self._latest_frames: dict = {}     # cam_name → {gray, trans, origin, cam_model}
-        self._probe_correspondences: list = []
+        self._probe_correspondences: dict = {}   # corner_id → {world, pixel, residual_m, source, count}
+        self._board_dirty: bool = False        # set when new corners added → Phase 1 resends board
+        self._collecting_probes: bool = False  # Phase 2 gate: only then cam_callback writes probe corrs
         # Per-camera stats shown in CAMERA BAR (replaces log spam)
         self._cam_stats: dict = {}         # cam_name → {frames, no_marker, few_charuco}
         self._cams_ready_time: dict = {}   # cam_name → monotonic time of first frame
+        # Stream health: maps short cam_name → full ros namespace (for recovery)
+        self._cam_namespaces: dict = {}    # cam_name → "/host/cam_serial"
+        self._recovery_attempts: dict = {} # cam_name → monotonic time of last recovery
         self._warned_frame_ids: set = set()  # frame_ids logged for non-optical warning
 
         # Static TF broadcaster for publishing solved projector pose
@@ -176,7 +182,9 @@ class CalibrationCore(Node):
         self._corner_rays = {}
         self._stereo_corners = set()
         self._latest_frames = {}
-        self._probe_correspondences = []
+        self._probe_correspondences = {}
+        self._board_dirty = False
+        self._collecting_probes = False
         self._cam_stats = {}
         self._cams_ready_time = {}
 
@@ -248,6 +256,7 @@ class CalibrationCore(Node):
 
             cam_name = cam.split('/')[-1]
             self._individual_msg_count[cam_name] = 0
+            self._cam_namespaces[cam_name] = cam
             rgb_sub.registerCallback(lambda msg, n=cam_name: self._on_individual_msg(n))
 
             ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, info_sub], 10, 0.1)
@@ -267,6 +276,44 @@ class CalibrationCore(Node):
     def _on_individual_msg(self, name):
         if name in self._individual_msg_count:
             self._individual_msg_count[name] += 1
+
+    def check_stream_health(self, stale_threshold=10.0, recovery_cooldown=30.0):
+        """
+        Check all subscribed cameras for stale streams.  If a camera hasn't
+        produced a frame in `stale_threshold` seconds, attempt to toggle its
+        color stream off/on.  Returns list of cam_names that were recovered.
+
+        Respects `recovery_cooldown` to avoid spamming toggle attempts.
+        """
+        now = time.monotonic()
+        recovered = []
+        for cam_name in list(self._cam_namespaces):
+            fd = self._latest_frames.get(cam_name)
+            last_frame = fd['timestamp'] if fd else self._cams_ready_time.get(cam_name, 0.0)
+            stale_s = now - last_frame if last_frame > 0 else now
+            if stale_s < stale_threshold:
+                continue
+            # Check cooldown
+            last_recovery = self._recovery_attempts.get(cam_name, 0.0)
+            if now - last_recovery < recovery_cooldown:
+                continue
+            cam_ns = self._cam_namespaces[cam_name]
+            self._debug_log(
+                f"[{cam_name}] Stream stale ({stale_s:.0f}s) — toggling color stream")
+            self._recovery_attempts[cam_name] = now
+            try:
+                subprocess.run(
+                    ["ros2", "param", "set", cam_ns, "enable_color", "false"],
+                    capture_output=True, text=True, timeout=5)
+                time.sleep(1.0)
+                subprocess.run(
+                    ["ros2", "param", "set", cam_ns, "enable_color", "true"],
+                    capture_output=True, text=True, timeout=5)
+                recovered.append(cam_name)
+                self._debug_log(f"[{cam_name}] Recovery toggle sent")
+            except Exception as e:
+                self._debug_log(f"[{cam_name}] Recovery failed: {e}")
+        return recovered
 
     def stop_projector_calibration(self, cameras):
         self.is_calibrating_proj = False
@@ -406,6 +453,26 @@ class CalibrationCore(Node):
                                 corner_id, pt.tolist(), cam_name)
                             if is_new:
                                 points_added += 1
+                            # Phase 2 probe: running-average per corner (deduped by corner_id)
+                            if self._collecting_probes and corner_id in self.calibrator.corner_pixels:
+                                new_res  = float(residuals.max())
+                                existing = self._probe_correspondences.get(corner_id)
+                                if existing is None:
+                                    pu, pv = self.calibrator.corner_pixels[corner_id]
+                                    self._probe_correspondences[corner_id] = {
+                                        'world':      pt.tolist(),
+                                        'pixel':      [float(pu), float(pv)],
+                                        'residual_m': new_res,
+                                        'source':     'stereo',
+                                        'count':      1,
+                                    }
+                                else:
+                                    n = existing['count']
+                                    existing['world'] = [
+                                        (existing['world'][i] * n + pt[i]) / (n + 1)
+                                        for i in range(3)]
+                                    existing['residual_m'] = (existing['residual_m'] * n + new_res) / (n + 1)
+                                    existing['count'] = n + 1
                             continue
                         elif not in_bounds:
                             self._debug_log(
@@ -450,6 +517,7 @@ class CalibrationCore(Node):
             self._debug_log(
                 f"[{cam_name}] +{points_added} new  total={obs}  "
                 f"multi-cam={multi}  stereo={stereo}")
+            self._board_dirty = True  # trigger reactive board refresh in Phase 1/2 loop
 
     def _wait_for_fresh_frames(self, timeout=5.0):
         """
@@ -516,87 +584,179 @@ class CalibrationCore(Node):
         t.transform.rotation.w = float(tf_json['qw'])
         self._tf_static_broadcaster.sendTransform(t)
 
-    def run_camera_consistency_phase(self, proj_info, send_board_fn, status_cb=None):
-        """
-        Project a coarse dot grid, assess inter-camera triangulation consistency,
-        and optionally correct camera origin positions.
-
-        Applies corrections to the camera TF JSON files and republishes TFs so
-        subsequent cam_callback calls use the corrected extrinsics.
-
-        Returns (corrected: bool,
-                 before_mm: {cam: mean_residual_mm},
-                 after_mm:  {cam: estimated_residual_mm})
-        """
-        # Coarse 5×3 grid — 15 dots, fast enough for a pre-pass
-        positions = make_probe_positions(
-            proj_info['width'], proj_info['height'], nx=5, ny=3)
-
-        baseline = self._capture_probe_baseline(proj_info, send_board_fn, status_cb)
-        dot_rays  = self._probe_dot_grid(
-            proj_info, send_board_fn, positions, baseline, status_cb)
-        multi = [r for r in dot_rays if len(r) >= 2]
-
-        if not multi:
-            self._debug_log("Consistency check: no multi-camera dots detected.")
-            return False, {}, {}
-
-        before_m  = assess_consistency(multi)
-        before_mm = {k: v * 1000 for k, v in before_m.items()}
-        max_mm    = max(before_mm.values(), default=0.0)
-        self._debug_log(
-            f"Camera consistency before: "
-            + "  ".join(f"{k}={v:.1f}mm" for k, v in before_mm.items()))
-
-        if max_mm < 3.0:
-            self._debug_log("Consistency OK — no correction needed.")
-            return False, before_mm, before_mm
-
-        self._debug_log(f"Max residual {max_mm:.1f}mm > 3mm — optimising camera positions…")
-        corrections = refine_camera_translations(multi)
-        if not corrections:
-            self._debug_log("Consistency optimisation unavailable (scipy missing?).")
-            return False, before_mm, before_mm
-
-        # Apply corrections: update JSON files and republish TFs immediately
-        for cam_name, delta in corrections.items():
-            if np.linalg.norm(delta) < 0.001:   # < 1mm — skip
+    def _apply_consistency_corrections(self, corrections):
+        """Apply camera pose corrections to TF JSON files and republish TFs."""
+        for cam_name, correction in corrections.items():
+            delta_t, delta_r = correction
+            t_mm  = float(np.linalg.norm(delta_t) * 1000)
+            r_rad = float(np.linalg.norm(delta_r))
+            if t_mm < 1.0 and r_rad < 1e-3:   # < 1 mm and < 0.06° — skip
                 continue
             cam_frame = f"{cam_name}_link"
             tf_file   = f"{CALIBRATIONS_PATH}/tf_configs/{cam_frame}.json"
             try:
                 with open(tf_file) as f:
                     tf_data = json.load(f)
-                tf_data['x'] += float(delta[0])
-                tf_data['y'] += float(delta[1])
-                tf_data['z'] += float(delta[2])
-                tf_data['_consistency_correction_mm'] = \
-                    round(float(np.linalg.norm(delta) * 1000), 2)
+                tf_data['x'] += float(delta_t[0])
+                tf_data['y'] += float(delta_t[1])
+                tf_data['z'] += float(delta_t[2])
+                tf_data['_consistency_correction_mm'] = round(t_mm, 2)
+                if r_rad > 1e-6:
+                    # Apply rotation correction to existing quaternion.
+                    # delta_r is an angle-axis in sandbox_origin frame; it
+                    # pre-multiplies the existing rotation so the resulting
+                    # ray directions in sandbox frame are R_delta @ d_old.
+                    angle = r_rad
+                    axis  = delta_r / angle
+                    s     = float(np.sin(angle / 2))
+                    q_delta = np.array([
+                        axis[0]*s, axis[1]*s, axis[2]*s, float(np.cos(angle / 2))])
+                    q_old = np.array([
+                        tf_data['qx'], tf_data['qy'],
+                        tf_data['qz'], tf_data['qw']])
+                    # Hamilton product: q_delta * q_old  (sandbox-frame rotation first)
+                    x1, y1, z1, w1 = q_delta
+                    x2, y2, z2, w2 = q_old
+                    q_new = np.array([
+                        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+                        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                    ])
+                    q_new /= np.linalg.norm(q_new)
+                    tf_data['qx'] = float(q_new[0])
+                    tf_data['qy'] = float(q_new[1])
+                    tf_data['qz'] = float(q_new[2])
+                    tf_data['qw'] = float(q_new[3])
+                    tf_data['_consistency_correction_deg'] = \
+                        round(float(np.degrees(r_rad)), 3)
                 with open(tf_file, 'w') as f:
                     json.dump(tf_data, f, indent=4)
                 self._publish_camera_tf(cam_frame, tf_data)
+                rot_str = (f"  rot={np.degrees(r_rad):+.2f}°" if r_rad > 1e-6 else "")
                 self._debug_log(
                     f"  {cam_name}: corrected "
-                    f"[{delta[0]*1000:+.1f},{delta[1]*1000:+.1f},{delta[2]*1000:+.1f}] mm")
+                    f"[{delta_t[0]*1000:+.1f},{delta_t[1]*1000:+.1f},"
+                    f"{delta_t[2]*1000:+.1f}] mm{rot_str}")
             except FileNotFoundError:
                 self._debug_log(f"  {cam_name}: TF file not found, skipping")
             except Exception as e:
                 self._debug_log(f"  {cam_name}: correction failed: {e}")
 
-        time.sleep(0.5)   # let TF buffer propagate
+    def run_camera_consistency_phase(self, proj_info, send_board_fn, status_cb=None):
+        """
+        Project a coarse dot grid, assess inter-camera triangulation consistency,
+        and iteratively correct camera poses (translation + rotation).
 
-        after_m  = estimated_residuals_after(multi, corrections)
-        after_mm = {k: v * 1000 for k, v in after_m.items()}
-        self._debug_log(
-            f"Camera consistency after (estimated): "
-            + "  ".join(f"{k}={v:.1f}mm" for k, v in after_mm.items()))
-        return True, before_mm, after_mm
+        Runs up to 3 iterations.  Each iteration re-collects fresh rays using
+        corrected TFs, then re-optimises.  Stops early when the max residual
+        drops below 5 mm or improvement stalls (<15 %).
+
+        Returns (corrected: bool,
+                 before_mm: {cam: initial_residual_mm},
+                 after_mm:  {cam: final_residual_mm})
+        """
+        MAX_ITERS       = 3
+        TARGET_MM       = 5.0
+        MIN_IMPROVEMENT = 0.15   # 15 %
+
+        positions = make_probe_positions(
+            proj_info['width'], proj_info['height'], nx=5, ny=3)
+
+        initial_before_mm = None
+        final_after_mm    = {}
+        prev_max_mm       = None
+        corrected_any     = False
+
+        for iteration in range(MAX_ITERS):
+            tag = f"Iter {iteration + 1}/{MAX_ITERS}"
+
+            # 1. Capture fresh baseline + dot rays with current TFs
+            if status_cb:
+                status_cb(f"{tag}: capturing baseline…")
+            baseline = self._capture_probe_baseline(proj_info, send_board_fn, status_cb)
+            dot_rays = self._probe_dot_grid(
+                proj_info, send_board_fn, positions, baseline, status_cb)
+            multi = [r for r in dot_rays if len(r) >= 2]
+
+            if not multi:
+                self._debug_log(f"{tag}: no multi-camera dots detected.")
+                if iteration == 0:
+                    return False, {}, {}
+                break   # keep results from previous iteration
+
+            # 2. Measure consistency
+            before_m   = assess_consistency(multi)
+            iter_mm    = {k: v * 1000 for k, v in before_m.items()}
+            max_mm     = max(iter_mm.values(), default=0.0)
+
+            if initial_before_mm is None:
+                initial_before_mm = iter_mm
+
+            self._debug_log(
+                f"{tag}: " +
+                "  ".join(f"{k}={v:.1f}mm" for k, v in iter_mm.items()))
+
+            # 3. Converged?
+            if max_mm < TARGET_MM:
+                self._debug_log(
+                    f"{tag}: {max_mm:.1f}mm < {TARGET_MM}mm — converged.")
+                final_after_mm = iter_mm
+                break
+
+            # 4. Diminishing returns?
+            if prev_max_mm is not None:
+                improvement = 1.0 - max_mm / prev_max_mm
+                if improvement < MIN_IMPROVEMENT:
+                    self._debug_log(
+                        f"{tag}: improvement {improvement * 100:.0f}% "
+                        f"< {MIN_IMPROVEMENT * 100:.0f}% — stopping.")
+                    final_after_mm = iter_mm
+                    break
+
+            # 5. Optimise
+            self._debug_log(
+                f"{tag}: max {max_mm:.1f}mm — optimising camera poses…")
+            scale_hint = max(before_m.values(), default=0.0)
+            corrections = refine_camera_translations(
+                multi, scale_hint_m=scale_hint)
+            if not corrections:
+                self._debug_log(
+                    f"{tag}: optimisation unavailable (scipy missing?).")
+                final_after_mm = iter_mm
+                break
+
+            # 6. Apply corrections to TF files + republish
+            self._apply_consistency_corrections(corrections)
+            time.sleep(0.5)   # let TF buffer propagate
+
+            # 7. Estimate post-correction residuals (for logging; next
+            #    iteration will measure for real with corrected TFs)
+            after_m  = estimated_residuals_after(multi, corrections)
+            after_mm = {k: v * 1000 for k, v in after_m.items()}
+            final_after_mm = after_mm
+            self._debug_log(
+                f"{tag} est. after: " +
+                "  ".join(f"{k}={v:.1f}mm" for k, v in after_mm.items()))
+
+            prev_max_mm   = max_mm
+            corrected_any = True
+
+        if initial_before_mm is None:
+            return False, {}, {}
+        if not final_after_mm:
+            final_after_mm = initial_before_mm
+        return corrected_any, initial_before_mm, final_after_mm
 
     def run_iterative_refinement(self, proj_info, send_board_fn,
                                  send_results_fn, config, status_cb=None):
         """
-        Iteratively re-probe the worst-error dot positions and re-solve until
+        Iteratively drop the worst-error probe correspondences and re-solve until
         the reprojection error converges or a limit is hit.
+
+        Uses ChArUco-based probe correspondences from _probe_correspondences.
+        Each iteration drops the worst-performing reprobe_frac of correspondences
+        (outlier rejection) and re-solves, replacing blob-based re-probing.
 
         Calls send_results_fn(results) after each improvement so Godot receives
         live updates throughout the process.
@@ -610,8 +770,9 @@ class CalibrationCore(Node):
         reprobe_frac = config.get('reprobe_worst_frac',  0.35)
 
         # ── Initial solve ────────────────────────────────────────────────────
-        extra_pts3d = [p['world'] for p in self._probe_correspondences] or None
-        extra_pts2d = [p['pixel'] for p in self._probe_correspondences] or None
+        probes = list(self._probe_correspondences.values())
+        extra_pts3d = [p['world'] for p in probes] or None
+        extra_pts2d = [p['pixel'] for p in probes] or None
         results = self.solve_projector_matrix(extra_pts3d, extra_pts2d)
         if results is None:
             return None
@@ -643,46 +804,32 @@ class CalibrationCore(Node):
             # ── Rank probe points by reprojection error ───────────────────
             P = np.array(results['projection_matrix'])
             ranked = []
-            for c in self._probe_correspondences:
+            for cid, c in self._probe_correspondences.items():
                 w    = np.array(c['world'] + [1.0])
                 proj = P @ w
                 if abs(proj[2]) < 1e-9:
                     continue
                 err = float(np.hypot(proj[0]/proj[2] - c['pixel'][0],
                                      proj[1]/proj[2] - c['pixel'][1]))
-                ranked.append((err, c))
+                ranked.append((err, cid))
             ranked.sort(key=lambda x: x[0], reverse=True)
 
-            n_reprobe = max(1, int(len(ranked) * reprobe_frac))
-            worst = ranked[:n_reprobe]
-            worst_positions = [
-                (int(c['pixel'][0]), int(c['pixel'][1])) for _, c in worst]
+            # ── Outlier rejection: drop worst-error correspondences ────────
+            n_drop   = max(1, int(len(ranked) * reprobe_frac))
+            drop_ids = {cid for _, cid in ranked[:n_drop]}
+            self._probe_correspondences = {
+                cid: c for cid, c in self._probe_correspondences.items()
+                if cid not in drop_ids
+            }
             self._debug_log(
-                f"  iter {iteration+1}: re-probing {n_reprobe} worst pts "
-                f"(err {worst[0][0]:.1f}–{worst[-1][0]:.1f}px)")
-
-            # ── Re-probe those positions ──────────────────────────────────
-            baseline  = self._capture_probe_baseline(
-                proj_info, send_board_fn, status_cb)
-            new_rays  = self._probe_dot_grid(
-                proj_info, send_board_fn, worst_positions, baseline, status_cb)
-            new_corrs = self._rays_to_correspondences(worst_positions, new_rays)
-
-            # Replace existing correspondences at re-probed pixels
-            for new_c in new_corrs:
-                replaced = False
-                for existing in self._probe_correspondences:
-                    if existing['pixel'] == new_c['pixel']:
-                        existing.update(new_c)
-                        existing['source'] += '_refined'
-                        replaced = True
-                        break
-                if not replaced:
-                    self._probe_correspondences.append(new_c)
+                f"  iter {iteration+1}: dropped {n_drop} outlier correspondences "
+                f"(err {ranked[0][0]:.1f}–{ranked[n_drop-1][0]:.1f}px)  "
+                f"remaining {len(self._probe_correspondences)}")
 
             # ── Re-solve ──────────────────────────────────────────────────
-            extra_pts3d = [p['world'] for p in self._probe_correspondences]
-            extra_pts2d = [p['pixel'] for p in self._probe_correspondences]
+            probes = list(self._probe_correspondences.values())
+            extra_pts3d = [p['world'] for p in probes]
+            extra_pts2d = [p['pixel'] for p in probes]
             new_results = self.solve_projector_matrix(extra_pts3d, extra_pts2d)
             if new_results is None:
                 break
@@ -723,6 +870,8 @@ class CalibrationCore(Node):
         """Number of ChArUco corners whose world point came from stereo triangulation."""
         return len(self._stereo_corners)
 
+    # ── Blob-based dot probe — used only by run_camera_consistency_check ──────
+
     def _capture_probe_baseline(self, proj_info, send_board_fn, status_cb=None):
         """Project black, wait for visual change, return baseline raw_gray dict."""
         pw, ph = proj_info['width'], proj_info['height']
@@ -736,128 +885,126 @@ class CalibrationCore(Node):
     def _probe_dot_grid(self, proj_info, send_board_fn, positions, baseline,
                         status_cb=None):
         """
-        Project each (u, v) position as a white dot, wait for visual change,
-        detect blobs in all cameras.
+        Project each (u, v) position as a white dot, detect blobs in all cameras.
+        Used by the camera consistency check to sample multi-camera ray residuals.
 
         Returns list of {cam_name: (origin_np, direction_np)} — one dict per dot.
-        Empty dict when no camera confirmed detection.
         """
         pw, ph = proj_info['width'], proj_info['height']
         dot_rays = []
         for i, (pu, pv) in enumerate(positions):
             pre_snap = {k: v['raw_gray'].copy() for k, v in self._latest_frames.items()}
             send_board_fn(make_dot_image(pw, ph, pu, pv))
-
-            dot_deadline = time.monotonic() + PROBE_DOT_TIMEOUT_S
             self._wait_for_visual_change(
                 pre_snap, timeout=max(1.0, PROBE_DOT_TIMEOUT_S - 2.0))
 
             detected = {}
-            _miss_logged = set()   # which cameras we already logged a miss for this dot
-
+            dot_deadline = time.monotonic() + PROBE_DOT_TIMEOUT_S
             while time.monotonic() < dot_deadline:
                 for cam_name, fd in list(self._latest_frames.items()):
                     if cam_name in detected:
                         continue
                     raw  = fd.get('raw_gray', fd['gray'])
                     base = baseline.get(cam_name)
-                    diff_img = cv2.absdiff(raw, base) if base is not None else raw
-                    max_diff = int(diff_img.max())
                     blobs = detect_blob_centroids(raw, base)
                     if blobs:
-                        best = blobs[0]   # sorted largest-first
-                        detected[cam_name] = (best, fd)
-                        self._debug_log(
-                            f"  [{cam_name}] dot {i+1}: "
-                            f"max_diff={max_diff} n_blobs={len(blobs)} "
-                            f"area={best[2]:.0f} → accepted")
-                    elif cam_name not in _miss_logged:
-                        _miss_logged.add(cam_name)
-                        self._debug_log(
-                            f"  [{cam_name}] dot {i+1}: "
-                            f"max_diff={max_diff} n_blobs=0 → no detection")
-
-                elapsed = PROBE_DOT_TIMEOUT_S - max(0, dot_deadline - time.monotonic())
+                        detected[cam_name] = (blobs[0], fd)
                 if status_cb:
+                    elapsed = PROBE_DOT_TIMEOUT_S - max(0, dot_deadline - time.monotonic())
                     status_cb(
                         f"Dot {i+1}/{len(positions)} ({pu},{pv})  "
                         f"{len(detected)}/{len(self._latest_frames)} cam(s)  "
-                        f"{elapsed:.1f}/{PROBE_DOT_TIMEOUT_S:.0f}s")
+                        f"{elapsed:.1f}s")
                 if len(detected) >= len(self._latest_frames):
                     break
                 time.sleep(0.05)
 
             rays = {}
             for cam_name, (centroid, fd) in detected.items():
-                cu, cv_b = centroid[0], centroid[1]   # centroid is (u, v, area)
+                cu, cv_b = centroid[0], centroid[1]
                 d = self._compute_ray_direction(
                     cu, cv_b, fd['cam_model'], fd['trans'], fd['origin'])
                 rays[cam_name] = (fd['origin'].copy(), d)
             dot_rays.append(rays)
         return dot_rays
 
-    def _rays_to_correspondences(self, positions, dot_rays):
-        """
-        Triangulate dot_rays and return a list of correspondence dicts
-        suitable for appending to _probe_correspondences.
-        Only dots with stereo triangulation residual < 10 mm or single-camera
-        heightmap fallback are included.
-        """
-        out = []
-        for (pu, pv), rays in zip(positions, dot_rays):
-            origins_d    = [r[0] for r in rays.values()]
-            directions_d = [r[1] for r in rays.values()]
-            if len(origins_d) >= 2:
-                try:
-                    pt, residuals = _triangulate_rays(origins_d, directions_d)
-                    if residuals.max() < 0.010:
-                        out.append({
-                            'world': pt.tolist(),
-                            'pixel': [float(pu), float(pv)],
-                            'residual_m': float(residuals.max()),
-                            'source': 'stereo',
-                        })
-                        continue
-                except Exception:
-                    pass
-            elif len(origins_d) == 1 and self.heightmap is not None:
-                origin, direction = origins_d[0], directions_d[0]
-                if abs(direction[2]) > 1e-6:
-                    t = -origin[2] / direction[2]
-                    point = origin + t * direction
-                    converged = False
-                    for _ in range(3):
-                        z = self._lookup_height(point[0], point[1])
-                        if z is None:
-                            break
-                        t     = (z - origin[2]) / direction[2]
-                        point = origin + t * direction
-                        converged = True
-                    if converged:
-                        out.append({
-                            'world': point.tolist(),
-                            'pixel': [float(pu), float(pv)],
-                            'residual_m': None,
-                            'source': 'heightmap',
-                        })
-        return out
+    # ── ChArUco-based probe — used by Phase 2 of projector_calibration_flow ───
 
-    def run_dot_probe_phase(self, proj_info, send_board_fn, status_cb=None,
-                            positions=None):
+    def _collect_charuco_probes(self, send_board_fn, highlight_fn=None,
+                                status_cb=None, timeout=120.0, stagnation=30.0):
         """
-        Project a grid of white dots, triangulate via camera rays.
-        Populates (resets) self._probe_correspondences.
-        Returns number of accepted correspondences.
+        Project the ChArUco board and let cam_callback accumulate probe
+        correspondences at varied heights (objects placed on sandbox).
+
+        Only stereo-triangulated corner observations captured while
+        _collecting_probes is True are written into _probe_correspondences —
+        avoiding contamination from flat-surface corners collected during the
+        Phase 2 instruction screen.
+
+        Returns number of probe correspondences added.
         """
-        self._probe_correspondences = []
-        if positions is None:
-            positions = make_probe_positions(
-                proj_info['width'], proj_info['height'])
-        baseline = self._capture_probe_baseline(proj_info, send_board_fn, status_cb)
-        dot_rays = self._probe_dot_grid(proj_info, send_board_fn, positions,
-                                        baseline, status_cb)
-        self._probe_correspondences = self._rays_to_correspondences(positions, dot_rays)
+        self._probe_correspondences = {}
+        self._collecting_probes     = True
+        last_n                      = 0
+        last_progress_t             = time.monotonic()
+        deadline                    = time.monotonic() + timeout
+        last_board_t                = 0.0
+
+        try:
+            h = highlight_fn(self.calibrator) if highlight_fn else None
+            send_board_fn(self.calibrator.generate_board_image(h), "ChArUco probe phase")
+
+            while time.monotonic() < deadline:
+                now     = time.monotonic()
+                current = len(self._probe_correspondences)
+
+                if current > last_n:
+                    last_n          = current
+                    last_progress_t = now
+
+                # Reactive board refresh when new corners are detected
+                if self._board_dirty and now - last_board_t >= 0.5:
+                    self._board_dirty = False
+                    h = highlight_fn(self.calibrator) if highlight_fn else None
+                    send_board_fn(self.calibrator.generate_board_image(h))
+                    last_board_t = now
+
+                # Stream health: auto-recover stale cameras
+                self.check_stream_health()
+
+                if status_cb:
+                    remaining = max(0.0, deadline - now)
+                    stale     = now - last_progress_t
+                    status_cb(
+                        f"Collecting…  {current} probe correspondences  "
+                        f"remaining {remaining:.0f}s  stagnant {stale:.0f}s/{stagnation:.0f}s")
+
+                if now - last_progress_t >= stagnation:
+                    self._debug_log(
+                        f"ChArUco probe stagnated ({stagnation:.0f}s without new corners).")
+                    break
+
+                time.sleep(0.1)
+
+        finally:
+            self._collecting_probes = False
+
         return len(self._probe_correspondences)
+
+    def run_charuco_probe_phase(self, proj_info, send_board_fn, highlight_fn=None,
+                                status_cb=None):
+        """
+        Collect ChArUco probe correspondences while objects at varied heights
+        are present on the sandbox surface.  Replaces the blob-based dot probe.
+
+        Probe data (stereo-triangulated ChArUco corners) is collected into
+        _probe_correspondences separately from Phase 1 data in cal.observations,
+        allowing the solver to use both flat-surface and height-varied points.
+
+        Returns number of probe correspondences added.
+        """
+        self._probe_correspondences = {}
+        return self._collect_charuco_probes(send_board_fn, highlight_fn, status_cb)
 
     def publish_projector_tf(self, proj_id, result):
         """Publish projector_<id>_link TF in sandbox_origin via StaticTransformBroadcaster."""
@@ -1001,7 +1148,51 @@ class CalibrationCore(Node):
         errs = np.sqrt(((proj - pts2d) ** 2).sum(axis=1))
         rms     = float(np.sqrt((errs ** 2).mean()))
         max_err = float(errs.max())
-        self._debug_log(f"  RMS reprojection error: {rms:.2f} px   max: {max_err:.1f} px")
+        self._debug_log(f"  DLT reprojection error: {rms:.2f} px   max: {max_err:.1f} px")
+
+        # --- Nonlinear (LM) refinement: DLT solution → cv2.solvePnP ---
+        # Uses Levenberg-Marquardt to minimise the true nonlinear reprojection cost
+        # rather than the linear DLT cost.  Only accepted if RMS improves.
+        try:
+            rvec_init, _ = cv2.Rodrigues(R)
+            tvec_cv      = tvec.reshape(3, 1)
+            ok_lm, rvec_lm, tvec_lm = cv2.solvePnP(
+                pts3d.astype(np.float64),
+                pts2d.astype(np.float64),
+                K.astype(np.float64),
+                np.zeros(4, dtype=np.float64),
+                rvec_init.astype(np.float64),
+                tvec_cv.astype(np.float64),
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if ok_lm:
+                proj_lm, _ = cv2.projectPoints(
+                    pts3d, rvec_lm, tvec_lm, K, np.zeros(4))
+                proj_lm = proj_lm.reshape(-1, 2)
+                errs_lm = np.sqrt(((proj_lm - pts2d) ** 2).sum(axis=1))
+                rms_lm  = float(np.sqrt((errs_lm ** 2).mean()))
+                if rms_lm < rms:
+                    R_lm, _ = cv2.Rodrigues(rvec_lm)
+                    tvec     = tvec_lm.flatten()
+                    cam_pos  = -R_lm.T @ tvec
+                    R        = R_lm
+                    P        = K @ np.hstack([R_lm, tvec_lm.reshape(3, 1)])
+                    if P[2, 3] < 0:
+                        P = -P
+                    errs    = errs_lm
+                    rms     = rms_lm
+                    max_err = float(errs.max())
+                    self._debug_log(
+                        f"  LM refined: RMS={rms:.2f}px  max={max_err:.1f}px")
+                else:
+                    self._debug_log(
+                        f"  LM did not improve DLT "
+                        f"(LM={rms_lm:.2f}px  DLT={rms:.2f}px)")
+        except Exception as _lm_exc:
+            self._debug_log(f"  LM refinement skipped: {_lm_exc}")
+
+        self._debug_log(f"  Final RMS: {rms:.2f} px   max: {max_err:.1f} px")
 
         # Convert from OpenCV optical frame to ROS camera_link convention
         # optical: X-right, Y-down, Z-forward  →  link: X-forward, Y-left, Z-up
@@ -1273,6 +1464,15 @@ def camera_calibration_flow(stdscr, ros_node):
     if transform_data:
         os.makedirs(f"{calibrations_path}/tf_configs", exist_ok=True)
         out_file = f"{calibrations_path}/tf_configs/{cam_frame}.json"
+
+        # Load previous calibration for comparison before overwriting
+        _prev_cam_cal = None
+        try:
+            with open(out_file) as _f:
+                _prev_cam_cal = json.load(_f)
+        except Exception:
+            pass
+
         with open(out_file, 'w') as f:
             json.dump(transform_data, f, indent=4)
 
@@ -1280,6 +1480,28 @@ def camera_calibration_flow(stdscr, ros_node):
         warn     = "  (UNSTABLE — consider recalibrating)" if transform_data.get('_unstable') else ""
         stdscr.addstr(12, 2, f"SUCCESS! Saved to {out_file}", curses.A_BOLD)
         stdscr.addstr(13, 2, std_info + warn, curses.A_DIM)
+
+        # Delta vs. previous calibration
+        if _prev_cam_cal is not None:
+            try:
+                d_x = (transform_data['x'] - _prev_cam_cal['x']) * 1000
+                d_y = (transform_data['y'] - _prev_cam_cal['y']) * 1000
+                d_z = (transform_data['z'] - _prev_cam_cal['z']) * 1000
+                d_mm = float(np.sqrt(d_x**2 + d_y**2 + d_z**2))
+                # Rotation delta
+                q_old = np.array([_prev_cam_cal['qx'], _prev_cam_cal['qy'],
+                                   _prev_cam_cal['qz'], _prev_cam_cal['qw']])
+                q_new = np.array([transform_data['qx'], transform_data['qy'],
+                                   transform_data['qz'], transform_data['qw']])
+                dot = abs(float(np.dot(q_old, q_new)))
+                d_deg = float(np.degrees(2 * np.arccos(np.clip(dot, 0.0, 1.0))))
+                stdscr.addstr(14, 2,
+                    f"  vs. previous: Δpos={d_mm:.1f} mm  "
+                    f"(X={d_x:+.1f} Y={d_y:+.1f} Z={d_z:+.1f})  Δrot={d_deg:.2f}°",
+                    curses.A_DIM)
+            except Exception:
+                pass
+
         stdscr.refresh()
     else:
         stdscr.addstr(12, 2, "FAILED! No AprilTag transform received. Is the tag visible?",
@@ -1396,11 +1618,20 @@ def _draw_calibration_tui(stdscr, ros_node, phase_label, status_msg,
         miss_pct = 100 * stats['no_marker'] // total
         few_pct  = 100 * stats['few_charuco'] // total
         age      = now_m - ros_node._cams_ready_time.get(cam_name, now_m)
-        warmup   = f"  warmup {max(0.0, 3.0 - age):.1f}s" if age < 3.0 else ""
+        # Stream freshness
+        fd = ros_node._latest_frames.get(cam_name)
+        last_ts = fd['timestamp'] if fd else 0.0
+        stale_s = now_m - last_ts if last_ts > 0 else 0.0
+        suffix = ""
+        if age < 3.0:
+            suffix = f"  warmup {max(0.0, 3.0 - age):.1f}s"
+        elif stale_s > 5.0:
+            suffix = f"  STALE {stale_s:.0f}s"
+        attr = curses.A_STANDOUT if stale_s > 10.0 else curses.A_DIM
         _safe_addstr(stdscr, row, 2,
             f"{cam_name:<28}  f={stats['frames']}  "
-            f"no-marker={miss_pct}%  few-charuco={few_pct}%{warmup}",
-            curses.A_DIM)
+            f"no-marker={miss_pct}%  few-charuco={few_pct}%{suffix}",
+            attr)
         row += 1
     _safe_addstr(stdscr, max_y - 1, 2, footer, curses.A_DIM)
 
@@ -1589,16 +1820,23 @@ def projector_calibration_flow(stdscr, ros_node):
     godot_ip   = "127.0.0.1"
     godot_port = 5007
     sandbox_config = {}
-    try:
-        with open("/ros2_ws/config.json", "r") as f:
-            main_cfg       = json.load(f)
-            loader_settings = main_cfg.get("loader_settings", {})
-            godot_cfg      = loader_settings.get("godot_loader", {})
-            godot_ip       = godot_cfg.get("godot_ip",   godot_ip)
-            godot_port     = godot_cfg.get("godot_port", godot_port)
-            sandbox_config = loader_settings.get("repro_loader", {})
-    except Exception:
-        pass
+    for cfg_path in ["/config/sandbox.json", "/ros2_ws/config.json"]:
+        try:
+            with open(cfg_path, "r") as f:
+                main_cfg        = json.load(f)
+                loader_settings = main_cfg.get("loader_settings", {})
+                godot_cfg       = loader_settings.get("godot_loader", {})
+                godot_ip        = godot_cfg.get("godot_ip",   godot_ip)
+                godot_port      = godot_cfg.get("godot_port", godot_port)
+                sandbox_config  = loader_settings.get("repro_loader", {})
+                ros_node._debug_log(f"Config loaded from {cfg_path}")
+                break
+        except Exception:
+            continue
+    sb = sandbox_config.get('sandbox', {})
+    ros_node._debug_log(
+        f"Sandbox dimensions: {sb.get('width', 1.0)}×{sb.get('length', 1.0)} m"
+        + ("  (DEFAULTS — config not found!)" if not sandbox_config else ""))
 
     def send_board_to_godot(img, label=""):
         """Encode img as PNG and send update_projector_image command to Godot."""
@@ -1690,10 +1928,11 @@ def projector_calibration_flow(stdscr, ros_node):
                 ]),
                 (None, []),
                 ("What will happen:", [
-                    "  • 15 white dots are projected one at a time.",
+                    "  • 15 white dots are projected one at a time (up to 3 iterations).",
                     "  • Both cameras triangulate each dot independently.",
-                    "  • If inter-camera residuals exceed 3 mm, positions are optimised",
-                    "    and the camera TF files are updated immediately.",
+                    "  • If inter-camera residuals exceed 5 mm, poses are optimised",
+                    "    and the camera TF files are updated. Each iteration re-measures",
+                    "    with corrected TFs for progressive refinement.",
                 ]),
             ],
             [
@@ -1713,30 +1952,79 @@ def projector_calibration_flow(stdscr, ros_node):
             stdscr.refresh()
 
             def _cc_status(msg):
-                _safe_addstr(stdscr, 4, 4, msg)
+                _safe_addstr(stdscr, 4, 4, msg.ljust(80))
                 stdscr.refresh()
 
             corrected, before_mm, after_mm = ros_node.run_camera_consistency_phase(
                 proj_info, send_board_to_godot, _cc_status)
 
-            row = 6
+            # ── Results display ──
+            stdscr.erase()
+            _safe_addstr(stdscr, 0, 2,
+                f"Phase 0.5: Camera Consistency  —  {proj_id}", curses.A_BOLD)
+
+            row = 2
             for cam, mm in before_mm.items():
                 after = after_mm.get(cam, mm)
-                arrow = f"→ {after:.1f} mm (est.)" if corrected else ""
+                arrow = f" -> {after:.1f} mm" if corrected else ""
                 _safe_addstr(stdscr, row, 4,
-                    f"{cam:<30s}  before={mm:.1f} mm  {arrow}")
+                    f"{cam:<30s}  initial={mm:.1f} mm{arrow}")
                 row += 1
+
+            row += 1
             if corrected:
-                _safe_addstr(stdscr, row + 1, 2,
+                _safe_addstr(stdscr, row, 2,
                     "Corrections applied — TF files updated.", curses.A_BOLD)
             else:
-                _safe_addstr(stdscr, row + 1, 2,
+                _safe_addstr(stdscr, row, 2,
                     "Cameras consistent — no correction needed.", curses.A_DIM)
-            _safe_addstr(stdscr, row + 3, 2, "Press any key to continue.")
-            stdscr.refresh()
-            curses.flushinp()
-            stdscr.nodelay(False)
-            stdscr.getch()
+            row += 1
+
+            # ── Quality gate ──
+            final_max_mm = max(after_mm.values(), default=0.0)
+            if final_max_mm > 15.0:
+                row += 1
+                worst_cam = max(after_mm, key=after_mm.get)
+                _safe_addstr(stdscr, row, 2,
+                    f"WARNING: {worst_cam} still has {final_max_mm:.0f}mm "
+                    f"residual — heightmap distortion likely.",
+                    curses.A_STANDOUT)
+                row += 1
+                _safe_addstr(stdscr, row, 2,
+                    "Consider re-running camera calibration or "
+                    "checking AprilTag visibility.")
+                row += 1
+                _safe_addstr(stdscr, row, 2,
+                    "Press 'a' to abort, any other key to continue.")
+                stdscr.refresh()
+                curses.flushinp()
+                stdscr.nodelay(False)
+                key = stdscr.getch()
+                if key == ord('a'):
+                    _stop_and_notify()
+                    return
+            else:
+                row += 1
+                _safe_addstr(stdscr, row, 2, "Press any key to continue.")
+                stdscr.refresh()
+                curses.flushinp()
+                stdscr.nodelay(False)
+                stdscr.getch()
+
+            # ── Write per-camera quality weights to TF JSON ──
+            for cam_name in after_mm:
+                res_mm = after_mm[cam_name]
+                weight = max(0.1, 1.0 - res_mm / 50.0)
+                cam_frame = f"{cam_name}_link"
+                tf_file = f"{CALIBRATIONS_PATH}/tf_configs/{cam_frame}.json"
+                try:
+                    with open(tf_file) as f:
+                        tf_data = json.load(f)
+                    tf_data['_quality_weight'] = round(weight, 3)
+                    with open(tf_file, 'w') as f:
+                        json.dump(tf_data, f, indent=4)
+                except Exception:
+                    pass
 
     # ── Phase 1 setup instructions ────────────────────────────────────────────
     ok = _instruction_screen(stdscr,
@@ -1822,15 +2110,19 @@ def projector_calibration_flow(stdscr, ros_node):
                 footer="'q' abort",
             )
 
-            # ── refresh board when new corners arrive (throttled) ──
+            # ── refresh board when new corners arrive (throttled to 0.5 s) ──
             if n_obs > last_count:
                 last_count    = n_obs
                 last_progress = now
-                if now - last_board_send >= 5.0:
-                    highlight = pass_def['highlight_fn'](cal)
-                    board_img = cal.generate_board_image(highlight)
-                    send_board_to_godot(board_img)
-                    last_board_send = now
+            if ros_node._board_dirty and now - last_board_send >= 0.5:
+                ros_node._board_dirty = False
+                highlight = pass_def['highlight_fn'](cal)
+                board_img = cal.generate_board_image(highlight)
+                send_board_to_godot(board_img)
+                last_board_send = now
+
+            # ── stream health: auto-recover stale cameras ──
+            ros_node.check_stream_health()
 
             # ── exit conditions ──
             if pass_def['done_fn'](cal):
@@ -1862,7 +2154,7 @@ def projector_calibration_flow(stdscr, ros_node):
     # ── Phase 2 setup instructions ────────────────────────────────────────────
     stdscr.nodelay(False)
     ok = _instruction_screen(stdscr,
-        " Phase 2 — Active Dot Probe (height variation required) ",
+        " Phase 2 — ChArUco Probe (height variation required) ",
         [
             ("Why height variation matters:", [
                 "  With all points on a flat surface the solver cannot",
@@ -1881,24 +2173,23 @@ def projector_calibration_flow(stdscr, ros_node):
                 "  • Objects with flat horizontal tops work best",
                 "    (cardboard boxes, stacked boards, wooden blocks).",
                 "  • Each object should cover at least 20 × 20 cm so that",
-                "    several dot positions land on it.",
+                "    several board corners land on it.",
                 "  • Objects can be irregular — exact height does not need to",
                 "    be known; the cameras will triangulate the true 3-D position.",
             ]),
             (None, []),
             ("What will happen:", [
-                "  • The projector displays individual white dots one at a time.",
-                "  • Cameras wait for each dot to actually appear on screen",
-                "    before capturing (visual-change gated).",
-                f"  • Up to {PROBE_DOT_TIMEOUT_S:.0f} s per dot — total ~"
-                f"{len(make_probe_positions(proj_info['width'], proj_info['height'])) * PROBE_DOT_TIMEOUT_S / 60:.0f}–"
-                f"{len(make_probe_positions(proj_info['width'], proj_info['height'])) * PROBE_DOT_TIMEOUT_S * 2 / 60:.0f} min.",
-                "  • Each successfully triangulated dot adds one high-quality",
-                "    pixel↔world correspondence to the solve.",
+                "  • The projector continues to display the ChArUco board.",
+                "  • Cameras detect board corners on the object surfaces,",
+                "    giving correspondences at different heights.",
+                "  • The board updates in real time as new corners are found:",
+                "    red = unseen  yellow = 1 camera  green = stereo-triangulated.",
+                "  • Collection stops automatically when no new corners arrive",
+                "    for 30 s, or after 2 min maximum.",
             ]),
         ],
         [
-            ("ENTER / SPACE  — objects placed, start dot probe",  curses.A_BOLD),
+            ("ENTER / SPACE  — objects placed, start ChArUco probe", curses.A_BOLD),
             ("s              — skip height variation (coarser calibration)", curses.A_DIM),
             ("q              — cancel and return to menu",              curses.A_DIM),
         ],
@@ -1909,37 +2200,46 @@ def projector_calibration_flow(stdscr, ros_node):
 
     skip_probe = (ok is None)   # 's' — skip height variation
 
-    # ── Phase 2: Active dot probing ───────────────────────────────────────────
+    # ── Phase 2: ChArUco probe at varied heights ──────────────────────────────
     n_charuco_obs = cal.n_observed()
     if not skip_probe and n_charuco_obs >= 10:
-        _probe_status_msg = ["Initialising…"]
-
         def _probe_status(msg):
-            _probe_status_msg[0] = msg
             _draw_calibration_tui(
                 stdscr, ros_node,
-                phase_label=f"Phase 2 — Active Dot Probe  {proj_id}",
+                phase_label=f"Phase 2 — ChArUco Probe  {proj_id}",
                 status_msg=msg,
                 cal=cal,
-                footer="waiting for dots…")
+                coverage_grid=cal.get_coverage_grid(),
+                footer="'s' skip")
 
-        n_probe = ros_node.run_dot_probe_phase(proj_info, send_board_to_godot, _probe_status)
-        ros_node._debug_log(f"Dot probe complete: {n_probe} correspondences.")
+        n_probe = ros_node.run_charuco_probe_phase(
+            proj_info, send_board_to_godot,
+            highlight_fn=lambda c: c.get_unseen_corners(),
+            status_cb=_probe_status)
+        ros_node._debug_log(f"ChArUco probe complete: {n_probe} correspondences.")
         _draw_calibration_tui(
             stdscr, ros_node,
-            phase_label=f"Phase 2 — Active Dot Probe  {proj_id}",
-            status_msg=f"Done — {n_probe} correspondences added.",
+            phase_label=f"Phase 2 — ChArUco Probe  {proj_id}",
+            status_msg=f"Done — {n_probe} probe correspondences added.",
             cal=cal)
         time.sleep(1.0)
     else:
         if skip_probe:
-            ros_node._debug_log("Dot probe skipped (height variation skipped by user).")
+            ros_node._debug_log("ChArUco probe skipped (height variation skipped by user).")
         else:
-            ros_node._debug_log("Dot probe skipped (too few ChArUco corners).")
+            ros_node._debug_log("ChArUco probe skipped (too few ChArUco corners).")
 
     # ── 6. Iterative refinement + live Godot updates ──────────────────────────
     os.makedirs(f"{CALIBRATIONS_PATH}/tf_configs", exist_ok=True)
     out_file = f"{CALIBRATIONS_PATH}/tf_configs/projector_{proj_id}.json"
+
+    # Load previous calibration before overwriting — used for delta display
+    _prev_proj_cal = None
+    try:
+        with open(out_file) as _f:
+            _prev_proj_cal = json.load(_f)
+    except Exception:
+        pass
 
     def _save_results(res):
         with open(out_file, 'w') as f:
@@ -2031,8 +2331,37 @@ def projector_calibration_flow(stdscr, ros_node):
     _safe_addstr(stdscr, 10, 4,
         "(translation = optical centre C, NOT OpenCV t vector; basis columns = cam_link axes in world)")
 
-    _safe_addstr(stdscr, 12, 2, f"Saved: {out_file}", curses.A_DIM)
-    _safe_addstr(stdscr, 13, 2, "Press any key to return to menu.")
+    # ── Delta vs. previous calibration ───────────────────────────────────────
+    detail_row = 12
+    if _prev_proj_cal is not None:
+        try:
+            prev_pos = _prev_proj_cal['extrinsics']['translation']
+            prev_rms = _prev_proj_cal['reprojection']['rms_px']
+            d_xyz_mm = [abs(pos[i] - prev_pos[i]) * 1000 for i in range(3)]
+            d_rms    = repro['rms_px'] - prev_rms
+            # Rotation delta: angle between old and new basis matrices
+            prev_basis = np.array(_prev_proj_cal['extrinsics']['basis'], dtype=np.float64)
+            new_basis  = np.array(results['extrinsics']['basis'],         dtype=np.float64)
+            R_rel  = new_basis.T @ prev_basis
+            cos_a  = np.clip((np.trace(R_rel) - 1) / 2, -1.0, 1.0)
+            d_deg  = float(np.degrees(np.arccos(cos_a)))
+            rms_sym = '↓' if d_rms < 0 else '↑'
+            _safe_addstr(stdscr, detail_row, 2,
+                "── vs. previous calibration ──", curses.A_DIM)
+            _safe_addstr(stdscr, detail_row + 1, 4,
+                f"position Δ  X={d_xyz_mm[0]:.1f} mm  "
+                f"Y={d_xyz_mm[1]:.1f} mm  Z={d_xyz_mm[2]:.1f} mm  "
+                f"rot={d_deg:.2f}°")
+            _safe_addstr(stdscr, detail_row + 2, 4,
+                f"RMS {prev_rms:.2f} px → {repro['rms_px']:.2f} px  "
+                f"({rms_sym}{abs(d_rms):.2f} px)",
+                curses.A_BOLD if d_rms < 0 else curses.A_DIM)
+            detail_row += 4
+        except Exception:
+            pass
+
+    _safe_addstr(stdscr, detail_row,     2, f"Saved: {out_file}", curses.A_DIM)
+    _safe_addstr(stdscr, detail_row + 1, 2, "Press any key to return to menu.")
     stdscr.refresh()
     curses.flushinp()
     stdscr.nodelay(False)
